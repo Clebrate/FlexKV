@@ -15,7 +15,7 @@
 import queue
 import threading
 import time
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import selectors
 import os
 from queue import Queue

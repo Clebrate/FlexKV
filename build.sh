@@ -66,6 +66,14 @@ else
     echo "Warning: Build lib directory $BUILD_LIB_PATH not found"
 fi
 
+# setup.py defaults FLEXKV_ENABLE_METRICS=1; if CMake turned monitoring OFF (cache or env), Python must match
+# or nvcc/g++ will still define FLEXKV_ENABLE_MONITORING but third_party/prometheus-cpp was never built.
+if [ -f "${PROJECT_ROOT}/build/CMakeCache.txt" ] && \
+   grep -q '^FLEXKV_ENABLE_MONITORING:BOOL=OFF' "${PROJECT_ROOT}/build/CMakeCache.txt"; then
+    export FLEXKV_ENABLE_METRICS=0
+    echo "=== CMake has FLEXKV_ENABLE_MONITORING=OFF; export FLEXKV_ENABLE_METRICS=0 for setup.py ==="
+fi
+
 echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
 echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
 

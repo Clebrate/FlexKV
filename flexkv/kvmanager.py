@@ -119,6 +119,9 @@ class KVManager:
     def shutdown(self) -> None:
         if self.server_client_mode:
             self.dp_client.shutdown()
+            # Popen 子进程需在此 join/wait；仅依赖 KVServerHandle.__del__ 易与 GC 顺序纠缠
+            if self.server_handle is not None:
+                self.server_handle.shutdown()
         else:
             self.kv_task_engine.shutdown()
 

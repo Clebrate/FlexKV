@@ -107,20 +107,44 @@ class ClientManager:
             return self.client_dict[dp_client_id].is_ready
         return False
 
+    def shutdown(self) -> None:
+        for dp_client in self.client_dict.values():
+            with contextlib.suppress(Exception):
+                dp_client.send_to_client.close(linger=0)
+        self.client_dict.clear()
+        self.free_client_ids.clear()
+
 class KVServerHandle:
     def __init__(self, process: Union[mp.Process, 'subprocess.Popen']):
         self.process = process
 
+    def _is_alive(self) -> bool:
+        if hasattr(self.process, "is_alive"):
+            return self.process.is_alive()
+        if hasattr(self.process, "poll"):
+            return self.process.poll() is None
+        return False
+
     def shutdown(self) -> None:
-        self.process.join(timeout=5)
-        if self.process.is_alive():
+        if hasattr(self.process, "join"):
+            self.process.join(timeout=5)
+        elif hasattr(self.process, "wait"):
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.process.wait(timeout=5)
+
+        if self._is_alive():
             flexkv_logger.info("force terminate the server process")
             self.process.terminate()
-            self.process.join()
+            if hasattr(self.process, "join"):
+                self.process.join()
+            elif hasattr(self.process, "wait"):
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.process.wait(timeout=5)
 
     def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
+        with contextlib.suppress(Exception):
+            if self._is_alive():
+                self.shutdown()
 
 class KVServer:
     def __init__(
@@ -146,6 +170,7 @@ class KVServer:
         self.req_counter = 0
         self._is_ready = False
         self._running = False
+        self._engine_shutdown = False
 
         # Request handler dispatch table
         self.request_handlers = {
@@ -163,6 +188,22 @@ class KVServer:
             TryWaitRequest: self._handle_try_wait_request,
             ShutdownRequest: self._handle_shutdown_request,
         }
+
+    def _shutdown_engine(self) -> None:
+        if self._engine_shutdown:
+            return
+        with contextlib.suppress(Exception):
+            self.kv_task_engine.shutdown()
+        self._engine_shutdown = True
+
+    def _cleanup(self) -> None:
+        self._shutdown_engine()
+        with contextlib.suppress(Exception):
+            self.client_manager.shutdown()
+        with contextlib.suppress(Exception):
+            self.recv_from_client.close(linger=0)
+        with contextlib.suppress(Exception):
+            self.context.term()
 
     def is_ready(self) -> bool:
         return self._is_ready
@@ -285,8 +326,7 @@ class KVServer:
 
         # Cleanup after shutdown
         flexkv_logger.info("Server shutting down, cleaning up...")
-        if hasattr(self, 'kvmanager'):
-            self.kvmanager.shutdown()
+        self._cleanup()
         flexkv_logger.info("Server shutdown complete")
 
 
@@ -415,7 +455,8 @@ class KVServer:
         self._running = False
 
     def __del__(self) -> None:
-        self.kv_task_engine.shutdown()
+        with contextlib.suppress(Exception):
+            self._cleanup()
 
 if __name__ == "__main__":
     import torch

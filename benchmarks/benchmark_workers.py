@@ -1,3 +1,11 @@
+"""Transfer worker 带宽微基准（H2D / D2H / SSD 等），与 cache_radix_uid 共用 common 配置。"""
+import sys
+from pathlib import Path
+
+_BENCHMARKS_ROOT = Path(__file__).resolve().parent
+if str(_BENCHMARKS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BENCHMARKS_ROOT))
+
 import time
 import json
 import multiprocessing as mp
@@ -16,7 +24,7 @@ from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
-from utils import load_config
+from common.utils import load_config
 
 # flexkv_logger.set_level("OFF")
 
@@ -469,7 +477,7 @@ def parse_args():
                         default=16)
     parser.add_argument("--config",
                         type=str,
-                        default="./benchmarks/example_config.yml")
+                        default="benchmarks/common/example_config.yml")
     parser.add_argument("--shuffle-ids",
                         action="store_true")
     parser.add_argument("--warmup-round",

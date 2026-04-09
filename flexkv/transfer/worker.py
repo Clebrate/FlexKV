@@ -113,7 +113,22 @@ class TransferWorkerBase(ABC):
         self.finished_ops_queue: MPQueue[int] = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
-        cudaHostRegister(self.op_buffer_tensor) 
+        self._op_buffer_registered = False
+        cudaHostRegister(self.op_buffer_tensor)
+        self._op_buffer_registered = True
+
+    def shutdown(self) -> None:
+        # Release pinned host memory explicitly before worker process exits.
+        if self._op_buffer_registered:
+            try:
+                cudaHostUnregister(self.op_buffer_tensor)
+            except Exception as e:
+                flexkv_logger.warning(f"op_buffer cudaHostUnregister failed: {e}")
+            self._op_buffer_registered = False
+        try:
+            self.transfer_conn.close()
+        except Exception:
+            pass
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -287,12 +302,19 @@ class WorkerHandle:
             self.transfer_conn.close()
         except (BrokenPipeError, OSError):
             pass  # Pipe already closed
-        # set timeout to 5 seconds
-        self.process.join(timeout=5)
+        # Prefer graceful exit to ensure worker-side pinned buffers are unregistered.
+        self.process.join(timeout=30)
         if self.process.is_alive():
             print("force terminate the worker process")
             self.process.terminate()
-            self.process.join()
+            self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=2)
+        try:
+            self.process.close()
+        except Exception:
+            pass
 
     def __del__(self) -> None:
         if self.process.is_alive():
@@ -319,6 +341,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # Register CPU tensors with CUDA
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
+        self.cpu_tensor = cpu_blocks
+        self._cpu_tensor_registered = True
         self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
@@ -357,6 +381,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.transfer_sms_d2h = transfer_sms_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+
+    def shutdown(self) -> None:
+        if getattr(self, "_cpu_tensor_registered", False):
+            try:
+                cudaHostUnregister(self.cpu_tensor)
+            except Exception as e:
+                flexkv_logger.warning(f"cpu_tensor cudaHostUnregister failed: {e}")
+            self._cpu_tensor_registered = False
+        super().shutdown()
 
     def _transfer_impl(
         self,
@@ -486,6 +519,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
         cudaHostRegister(cpu_blocks)
+        self.cpu_tensor = cpu_blocks
+        self._cpu_tensor_registered = True
 
         self.num_layers = gpu_kv_layouts[0].num_layer
         # here the chunk size doesn't include the layer info
@@ -523,7 +558,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             for i in range(self.num_gpus)
             for j in range(len(self.gpu_blocks[i]))
         ]
-        cpu_blocks_ptr = cpu_blocks.data_ptr()
+        cpu_blocks_ptr = self.cpu_tensor.data_ptr()
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
         num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -532,7 +567,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_block_ptrs_flat,
             num_tensors_per_gpu,
             cpu_blocks_ptr,
-            dp_group_id,
+            self.dp_group_id,
             self.num_layers,
             self.gpu_kv_strides_in_bytes,
             self.gpu_block_strides_in_bytes,
@@ -540,6 +575,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
         )
+
+    def shutdown(self) -> None:
+        if getattr(self, "_cpu_tensor_registered", False):
+            try:
+                cudaHostUnregister(self.cpu_tensor)
+            except Exception as e:
+                flexkv_logger.warning(f"tp cpu_tensor cudaHostUnregister failed: {e}")
+            self._cpu_tensor_registered = False
+        super().shutdown()
 
 
     def _transfer_impl(self,
@@ -1527,6 +1571,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
         # unregist node info from redis server
         self.unregist_node_meta()
+        super().shutdown()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         layer_id = transfer_op.layer_id

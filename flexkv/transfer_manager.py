@@ -1,12 +1,12 @@
 import os
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import time
 import queue
 import selectors
 from queue import Queue
 from typing import Dict, Optional, List, Tuple, Any
 from abc import ABC, abstractmethod
-from multiprocessing import Process, Pipe, Event
+from torch.multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
 import zmq
 import nvtx
