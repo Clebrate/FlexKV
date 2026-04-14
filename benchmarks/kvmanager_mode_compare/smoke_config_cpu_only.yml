@@ -1,0 +1,13 @@
+# 轻量 CPU-only 配置：关闭 SSD 路径，避免部分环境里 SSD worker/daemon 初始化冲突导致 is_ready 卡住
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+cpu_cache_gb: 1
+ssd_cache_gb: 0
+enable_gds: false

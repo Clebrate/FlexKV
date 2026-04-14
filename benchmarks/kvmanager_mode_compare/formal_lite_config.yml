@@ -1,0 +1,15 @@
+# A medium-size config for mode compare.
+# Goal: closer to example_config.yml than smoke, but safer in constrained containers.
+num_layers: 16
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+cpu_cache_gb: 2
+ssd_cache_gb: 4
+ssd_cache_dir: ./ssd_cache_formal_lite/
+enable_gds: false

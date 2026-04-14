@@ -1,0 +1,15 @@
+# 轻量配置：减小 CPU KV 连续块体积，避免 Transfer worker 内 cudaHostRegister(整块 cpu_blocks) 失败
+# （example_config 约 8GB CPU，在部分容器/cgroup 下 register 会返回 error code 1）
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+cpu_cache_gb: 1
+ssd_cache_gb: 2
+ssd_cache_dir: /tmp/ssd_cache_smoke_20260414/
+enable_gds: false

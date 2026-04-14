@@ -1,0 +1,14 @@
+# Fresh SSD smoke config: same as smoke_config.yml but with a new clean SSD directory.
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+cpu_cache_gb: 1
+ssd_cache_gb: 2
+ssd_cache_dir: ./ssd_cache_smoke_fresh/
+enable_gds: false
