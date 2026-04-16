@@ -171,6 +171,7 @@ def _run_one_mode(
     transfer_manager_mode: str,
     ready_timeout_s: float,
     child_timeout_s: float,
+    gpu_block_capacity_ratio: float,
 ) -> dict:
     env = os.environ.copy()
     env["FLEXKV_SERVER_CLIENT_MODE"] = "1" if mode == "server_client" else "0"
@@ -196,6 +197,8 @@ def _run_one_mode(
         str(ready_timeout_s),
         "--transfer-manager-mode",
         transfer_manager_mode,
+        "--gpu-block-capacity-ratio",
+        str(gpu_block_capacity_ratio),
     ]
     # 不再用 PIPE 捕获 stdout：server_client 下孙进程可能继承该 fd，导致 communicate() 等 EOF 卡住
     tmp_stdout = tempfile.NamedTemporaryFile(
@@ -273,7 +276,15 @@ def main() -> None:
     )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--sequence-length", type=int, default=1024)
-    p.add_argument("--cache-ratio", type=float, default=0.0)
+    p.add_argument(
+        "--cache-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "透传给 bench_one_run。1.0: 真实搬运路径；"
+            "0.0: 控制路径模式（仍提交任务并测 match/launch/wait）。"
+        ),
+    )
     p.add_argument(
         "--transfer-manager-mode",
         type=str,
@@ -292,6 +303,13 @@ def main() -> None:
         type=float,
         default=300.0,
         help="run_compare 级别子进程总超时秒数；用于兜底 KVManager.start() 卡死",
+    )
+    p.add_argument(
+        "--gpu-block-capacity-ratio",
+        type=float,
+        default=1.0,
+        metavar="R",
+        help="透传 bench_one_run：(0,1] 缩小 GPU block 池；1.0 为原行为",
     )
     p.add_argument("--warmup", type=int, default=0, help="每个模式先跑多少轮预热（不计入输出统计）")
     p.add_argument("--repeats", type=int, default=1, help="每个模式计入统计的轮数")
@@ -336,6 +354,8 @@ def main() -> None:
         p.error("--warmup 不能小于 0")
     if args.repeats <= 0:
         p.error("--repeats 必须大于 0")
+    if args.gpu_block_capacity_ratio <= 0 or args.gpu_block_capacity_ratio > 1.0:
+        p.error("--gpu-block-capacity-ratio 须在 (0, 1] 内")
 
     session = uuid.uuid4().hex[:12]
 
@@ -372,6 +392,7 @@ def main() -> None:
                 transfer_manager_mode=args.transfer_manager_mode,
                 ready_timeout_s=args.ready_timeout_s,
                 child_timeout_s=args.child_timeout_s,
+                gpu_block_capacity_ratio=args.gpu_block_capacity_ratio,
             )
             row["compare_session"] = session
             row["phase"] = phase

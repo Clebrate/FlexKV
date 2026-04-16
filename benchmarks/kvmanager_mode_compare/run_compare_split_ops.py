@@ -171,6 +171,9 @@ def _csv_run_row_flat() -> list[str]:
         "phase",
         "round_index",
         "mode",
+        "gpu_block_capacity_ratio",
+        "num_gpu_blocks_required",
+        "num_gpu_blocks",
     ]
     metrics = [
         "ready_total_ms",
@@ -210,8 +213,12 @@ def _append_csv_run_row(
     out_row["phase"] = row.get("phase", "")
     out_row["round_index"] = row.get("round_index", "")
     out_row["mode"] = row.get("mode", "")
+    out_row["gpu_block_capacity_ratio"] = row.get("gpu_block_capacity_ratio", "")
+    out_row["num_gpu_blocks_required"] = row.get("num_gpu_blocks_required", "")
+    out_row["num_gpu_blocks"] = row.get("num_gpu_blocks", "")
 
-    for k in fieldnames[8:]:
+    _base_len = 11
+    for k in fieldnames[_base_len:]:
         v = row.get(k)
         if v is None:
             out_row[k] = ""
@@ -249,6 +256,7 @@ def _run_one_mode(
     ready_timeout_s: float,
     child_timeout_s: float,
     transfer_manager_mode: str,
+    gpu_block_capacity_ratio: float,
 ) -> dict:
     env = os.environ.copy()
     env["FLEXKV_SERVER_CLIENT_MODE"] = "1" if mode == "server_client" else "0"
@@ -276,6 +284,8 @@ def _run_one_mode(
         str(ready_timeout_s),
         "--transfer-manager-mode",
         transfer_manager_mode,
+        "--gpu-block-capacity-ratio",
+        str(gpu_block_capacity_ratio),
     ]
     if measure_op == "get" and not prime_cache_for_get:
         cmd.append("--no-prime-cache-for-get")
@@ -354,7 +364,15 @@ def main() -> None:
     )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--sequence-length", type=int, default=1024)
-    p.add_argument("--cache-ratio", type=float, default=1.0)
+    p.add_argument(
+        "--cache-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "透传给 bench_one_run。1.0: 真实搬运路径；"
+            "0.0: 控制路径模式（仍提交任务并测 match/launch/wait）。"
+        ),
+    )
     p.add_argument("--warmup", type=int, default=0, help="每个 operation 每个 mode 先跑多少轮预热")
     p.add_argument("--get-repeats", type=int, default=500, help="get 计入统计的轮数")
     p.add_argument("--put-repeats", type=int, default=500, help="put 计入统计的轮数")
@@ -394,6 +412,16 @@ def main() -> None:
         default="thread",
         choices=("process", "thread"),
         help="传给 bench_one_run；thread 在容器环境下通常更稳定",
+    )
+    p.add_argument(
+        "--gpu-block-capacity-ratio",
+        type=float,
+        default=1.0,
+        metavar="R",
+        help=(
+            "透传 bench_one_run：(0,1] 缩小 GPU block 池以促使 get 含下层→GPU 传输；"
+            "1.0 保持原行为；direct/server_client 使用同一值。"
+        ),
     )
     p.set_defaults(prime_cache_for_get=True)
     p.add_argument("-o", "--output", type=str, default="", help="可选：写入 JSONL（每行一条）")
@@ -436,6 +464,8 @@ def main() -> None:
         p.error("--get-repeats 必须大于 0")
     if args.put_repeats <= 0:
         p.error("--put-repeats 必须大于 0")
+    if args.gpu_block_capacity_ratio <= 0 or args.gpu_block_capacity_ratio > 1.0:
+        p.error("--gpu-block-capacity-ratio 须在 (0, 1] 内")
 
     for mode in modes:
         if mode not in ("direct", "server_client"):
@@ -494,6 +524,7 @@ def main() -> None:
                     ready_timeout_s=args.ready_timeout_s,
                     child_timeout_s=args.child_timeout_s,
                     transfer_manager_mode=args.transfer_manager_mode,
+                    gpu_block_capacity_ratio=args.gpu_block_capacity_ratio,
                 )
                 row["compare_session"] = session
                 row["phase"] = phase
