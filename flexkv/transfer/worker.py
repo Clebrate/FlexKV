@@ -346,26 +346,33 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
 
-        transfer_kv_blocks(
-            gpu_block_id_list,
-            gpu_tensor_ptrs,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_layer_stride_in_bytes,
-            cpu_block_id_list,
-            self.cpu_tensor,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.chunk_size_in_bytes,
-            0,  # start_layer_id
-            self.num_layers,
-            transfer_num_cta,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            self.is_mla,
-            self.gpu_block_type_,
+        torch.cuda.nvtx.range_push(
+            f"flexkv.onboard.baseline.transfer_kv_blocks.{transfer_type.name}"
+            f".blocks={len(gpu_block_id_list)}.layers={self.num_layers}"
         )
+        try:
+            transfer_kv_blocks(
+                gpu_block_id_list,
+                gpu_tensor_ptrs,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_layer_stride_in_bytes,
+                cpu_block_id_list,
+                self.cpu_tensor,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                0,  # start_layer_id
+                self.num_layers,
+                transfer_num_cta,
+                transfer_type == TransferType.H2D,
+                use_ce_transfer,
+                self.is_mla,
+                self.gpu_block_type_,
+            )
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(

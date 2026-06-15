@@ -30,6 +30,11 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
   LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
   int completed = data->counter->fetch_add(1) + 1;
   if (completed == data->num_gpus) {
+    char callback_range_name[128];
+    snprintf(callback_range_name, sizeof(callback_range_name),
+             "flexkv.onboard.layerwise.callback.total.layers%d-%d",
+             data->start_layer, data->start_layer + data->layers_this_batch);
+    nvtxRangePushA(callback_range_name);
     // Notify via eventfd when all GPUs complete this layer batch
     if (data->enable_eventfd && data->layer_eventfds != nullptr) {
       // Signal each tp_rank's eventfd for completed layers
@@ -40,11 +45,19 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
           if (fd >= 0) {
             // Write 2 to support both get_key_buffer and get_value_buffer waits
             uint64_t val = 2;
+            char write_range_name[128];
+            snprintf(write_range_name, sizeof(write_range_name),
+                     "flexkv.onboard.layerwise.callback.eventfd_write.layer%d.tp%d",
+                     layer, tp_rank);
+            nvtxRangePushA(write_range_name);
             ssize_t ret = write(fd, &val, sizeof(val));
+            (void)ret;
+            nvtxRangePop();
           }
         }
       }
     }
+    nvtxRangePushA("flexkv.onboard.layerwise.callback.nvtx_bookkeeping");
     // End current NVTX range when all GPUs complete
     if (data->current_range_id_ptr != nullptr && *data->current_range_id_ptr != 0) {
       nvtxRangeEnd(*data->current_range_id_ptr);
@@ -53,7 +66,9 @@ static void CUDART_CB layer_done_host_callback(void *userData) {
     if (!data->is_last_batch && data->next_range_id_ptr != nullptr) {
       *data->next_range_id_ptr = nvtxRangeStartA(data->next_range_name);
     }
+    nvtxRangePop();
     delete data->counter;
+    nvtxRangePop();
   }
   delete data;
 }

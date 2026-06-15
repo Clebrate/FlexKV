@@ -1,111 +1,20 @@
 import tempfile
 from multiprocessing import Process
 import argparse
-import ctypes
-import os
-import select
-import socket
-import struct
-import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
 
 import torch
 
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig
 from utils import load_config
 from flexkv.kvmanager import KVManager
 from flexkv.kvtask import KVResponseStatus
 
 flexkv_logger.set_level("INFO")
-
-_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
-_EFD_SEMAPHORE = 0x1
-
-
-def _eventfd(initval: int = 0, flags: int = 0) -> int:
-    fd = _LIBC.eventfd(ctypes.c_uint(initval), ctypes.c_int(flags))
-    if fd == -1:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    return fd
-
-
-def _send_fds(sock: socket.socket, fds: List[int], extra_data: bytes) -> None:
-    packed = struct.pack(f"{len(fds)}i", *fds)
-    sock.sendmsg([extra_data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, packed)])
-
-
-class LayerwiseEventfdClient:
-    def __init__(self, socket_path: str, num_layers: int, num_counters: int = 3):
-        self.socket_path = socket_path
-        self.num_layers = num_layers
-        self.num_counters = num_counters
-        self.fds = [_eventfd(0, _EFD_SEMAPHORE) for _ in range(num_layers * num_counters)]
-        self.ready = threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def _run(self) -> None:
-        sock: Optional[socket.socket] = None
-        for _ in range(180):
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                sock.connect(self.socket_path)
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                sock.close()
-                sock = None
-                time.sleep(0.5)
-        if sock is None:
-            print(f"[LayerwiseEventfdClient] failed to connect to {self.socket_path}")
-            return
-
-        metadata = struct.pack("iiii", 0, 1, self.num_layers, self.num_counters)
-        sock.sendall(metadata)
-        fd_idx = 0
-        for counter_id in range(self.num_counters):
-            fds = self.fds[fd_idx:fd_idx + self.num_layers]
-            fd_idx += self.num_layers
-            _send_fds(sock, fds, struct.pack("i", counter_id))
-        sock.settimeout(30.0)
-        ack = sock.recv(1)
-        if ack == b"\x01":
-            print(f"[LayerwiseEventfdClient] eventfd handshake OK, layers={self.num_layers}")
-            self.ready.set()
-        else:
-            print(f"[LayerwiseEventfdClient] unexpected ack={ack!r}")
-        while True:
-            time.sleep(60)
-
-    def wait_ready(self, timeout: float = 120.0) -> None:
-        if not self.ready.wait(timeout):
-            raise TimeoutError("timed out waiting for layerwise eventfd handshake")
-
-    def wait_layer(self, counter_id: int, layer_id: int) -> None:
-        fd = self.fds[counter_id * self.num_layers + layer_id]
-        poller = select.poll()
-        poller.register(fd, select.POLLIN)
-        torch.cuda.nvtx.range_push(
-            f"flexkv.onboard.layerwise.eventfd_poll.layer{layer_id}"
-        )
-        try:
-            poller.poll()
-        finally:
-            torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push(
-            f"flexkv.onboard.layerwise.eventfd_read.layer{layer_id}"
-        )
-        try:
-            os.read(fd, 8)
-        finally:
-            torch.cuda.nvtx.range_pop()
 
 
 @dataclass
@@ -115,8 +24,6 @@ class BenchmarkConfig:
     sequence_length: int
     cache_ratio: float
     clear_cpu_cache: bool
-    layerwise_transfer: bool
-    counter_id: int
 
 def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_config):
     """Run tp_client process"""
@@ -164,20 +71,6 @@ def benchmark_flexkv(model_config: ModelConfig,
         raise ValueError(f"tp_size {model_config.tp_size} * dp_size {model_config.dp_size} is greater than "
                          f"the number of available GPUs {torch.cuda.device_count()}")
     print(f"{benchmark_config = }")
-
-    os.environ["FLEXKV_ENABLE_LAYERWISE_TRANSFER"] = "1" if benchmark_config.layerwise_transfer else "0"
-    GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = benchmark_config.layerwise_transfer
-
-    event_client = None
-    if benchmark_config.layerwise_transfer:
-        socket_path = os.environ.get("FLEXKV_LAYERWISE_EVENTFD_SOCKET", "/tmp/flexkv_layerwise_eventfd.sock")
-        try:
-            os.unlink(socket_path)
-        except FileNotFoundError:
-            pass
-        event_client = LayerwiseEventfdClient(socket_path, model_config.num_layers)
-        event_client.start()
-
     kvmanager = KVManager(model_config, cache_config)
     kvmanager.start()
 
@@ -202,8 +95,6 @@ def benchmark_flexkv(model_config: ModelConfig,
         time.sleep(3)
         flexkv_logger.info("waiting for flexkv to be ready")
     flexkv_logger.info("flexkv is ready")
-    if event_client is not None:
-        event_client.wait_ready()
 
     batch_sequence_tensor = []
     batch_slot_mapping = []
@@ -242,52 +133,15 @@ def benchmark_flexkv(model_config: ModelConfig,
     all_tokens = 0
     start_time = time.time()
     batch_get_ids = []
-    mode = "layerwise" if benchmark_config.layerwise_transfer else "baseline"
-    torch.cuda.nvtx.range_push(f"flexkv.onboard.{mode}.e2e")
-    try:
-        torch.cuda.nvtx.range_push(f"flexkv.onboard.{mode}.get_match_loop")
-        try:
-            for i in range(batch_size):
-                all_tokens += len(batch_sequence_tensor[i])
-                task_id, _ = kvmanager.get_match(batch_sequence_tensor[i],
-                                              token_mask=None)
-                batch_get_ids.append(task_id)
-        finally:
-            torch.cuda.nvtx.range_pop()
-        get_match_time = time.time() - start_time
-        torch.cuda.nvtx.range_push(f"flexkv.onboard.{mode}.launch_call")
-        try:
-            kvmanager.launch(
-                batch_get_ids,
-                batch_slot_mapping,
-                as_batch=True,
-                layerwise_transfer=benchmark_config.layerwise_transfer,
-                counter_id=benchmark_config.counter_id,
-            )
-        finally:
-            torch.cuda.nvtx.range_pop()
-        if benchmark_config.layerwise_transfer:
-            assert event_client is not None
-            torch.cuda.nvtx.range_push("flexkv.onboard.layerwise.eventfd_wait.total")
-            try:
-                for layer_id in range(model_config.num_layers):
-                    torch.cuda.nvtx.range_push(
-                        f"flexkv.onboard.layerwise.eventfd_wait.layer{layer_id}"
-                    )
-                    try:
-                        event_client.wait_layer(benchmark_config.counter_id, layer_id)
-                    finally:
-                        torch.cuda.nvtx.range_pop()
-            finally:
-                torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push(f"flexkv.onboard.{mode}.wait_call")
-        try:
-            get_result = kvmanager.wait(batch_get_ids)
-        finally:
-            torch.cuda.nvtx.range_pop()
-        elapsed_time_get = time.time() - start_time
-    finally:
-        torch.cuda.nvtx.range_pop()
+    for i in range(batch_size):
+        all_tokens += len(batch_sequence_tensor[i])
+        task_id, _ = kvmanager.get_match(batch_sequence_tensor[i],
+                                      token_mask=None)
+        batch_get_ids.append(task_id)
+    get_match_time = time.time() - start_time
+    kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=True)
+    get_result = kvmanager.wait(batch_get_ids)
+    elapsed_time_get = time.time() - start_time
     cached_tokens = 0
     for _, response in get_result.items():
         if response.status == KVResponseStatus.SUCCESS:
@@ -313,8 +167,6 @@ def parse_args():
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--cache-ratio", type=float, default=1)
     parser.add_argument("--clear-cpu-cache", action="store_true")
-    parser.add_argument("--layerwise-transfer", action="store_true")
-    parser.add_argument("--counter-id", type=int, default=0)
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -324,9 +176,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
         cache_ratio=args.cache_ratio,
-        clear_cpu_cache=args.clear_cpu_cache,
-        layerwise_transfer=args.layerwise_transfer,
-        counter_id=args.counter_id,
+        clear_cpu_cache=args.clear_cpu_cache
     )
     model_config, cache_config = load_config(args.config)
     #cache_config.num_cpu_blocks = 8192 - 2048

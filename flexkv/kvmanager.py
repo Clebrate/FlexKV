@@ -186,12 +186,16 @@ class KVManager:
                                                      cpu_only=cpu_only,
                                                      namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.get_match(
-                token_ids=token_ids,
-                token_mask=token_mask,
-                cpu_only=cpu_only,
-                namespace=namespace,
-            )
+            torch.cuda.nvtx.range_push("flexkv.onboard.api.get_match")
+            try:
+                task_id, mask = self.kv_task_engine.get_match(
+                    token_ids=token_ids,
+                    token_mask=token_mask,
+                    cpu_only=cpu_only,
+                    namespace=namespace,
+                )
+            finally:
+                torch.cuda.nvtx.range_pop()
         return task_id, mask
 
     def put_async(self,
@@ -264,16 +268,24 @@ class KVManager:
             slot_mappings = [slot_mappings]
         if isinstance(slot_mappings[0], torch.Tensor):
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
+        mode = "layerwise" if layerwise_transfer else "baseline"
+        torch.cuda.nvtx.range_push(f"flexkv.onboard.{mode}.api.launch")
         if self.server_client_mode:
-            return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer, counter_id)
+            try:
+                return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch, layerwise_transfer, counter_id)
+            finally:
+                torch.cuda.nvtx.range_pop()
         else:
-            return self.kv_task_engine.launch_tasks(
-                task_ids,
-                slot_mappings,
-                as_batch=as_batch,
-                layerwise_transfer=layerwise_transfer,
-                counter_id=counter_id
-            )
+            try:
+                return self.kv_task_engine.launch_tasks(
+                    task_ids,
+                    slot_mappings,
+                    as_batch=as_batch,
+                    layerwise_transfer=layerwise_transfer,
+                    counter_id=counter_id
+                )
+            finally:
+                torch.cuda.nvtx.range_pop()
 
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
@@ -292,7 +304,11 @@ class KVManager:
         if self.server_client_mode:
             return self.dp_client.wait(task_ids, timeout, completely)
         else:
-            return self.kv_task_engine.wait(task_ids, timeout, completely)
+            torch.cuda.nvtx.range_push("flexkv.onboard.api.wait")
+            try:
+                return self.kv_task_engine.wait(task_ids, timeout, completely)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):

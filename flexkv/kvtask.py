@@ -9,6 +9,7 @@ import copy
 from expiring_dict import ExpiringDict
 import nvtx
 import numpy as np
+import torch
 
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
@@ -769,41 +770,56 @@ class KVTaskEngine(KVTaskManager):
         assert isinstance(slot_mappings[0], np.ndarray)
         # trace launch tasks
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
-        self.set_slot_mappings(task_ids, slot_mappings)
+        torch.cuda.nvtx.range_push("flexkv.onboard.scheduler.set_slot_mappings")
+        try:
+            self.set_slot_mappings(task_ids, slot_mappings)
+        finally:
+            torch.cuda.nvtx.range_pop()
 
         # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
-            if batch_id == -1:
-                batch_id = self._gen_task_id()
-            if layerwise_transfer:
-                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-                    flexkv_logger.warning("layerwise transfer is not enabled")
-                    layerwise_transfer = False
-                elif not all_get:
-                    flexkv_logger.warning("only support layerwise get")
-                    layerwise_transfer = False
-            batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            batch_task_graph = self.merge_to_batch_kvtask(
-                batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
-            )
-            transfer_graphs = [batch_task_graph]
-            self.tasks[batch_id].status = TaskStatus.RUNNING
-            task_ids = [batch_id]
-        else:
-            transfer_graphs = []
-            for task_id in task_ids:
-                transfer_graph = self.check_task_ready(task_id)
-                if transfer_graph is not None and transfer_graph.num_ops > 0:
-                    transfer_graphs.append(transfer_graph)
+        torch.cuda.nvtx.range_push(
+            "flexkv.onboard.scheduler.build_graph."
+            f"{'layerwise' if layerwise_transfer else 'baseline'}"
+        )
+        try:
+            if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
+                if batch_id == -1:
+                    batch_id = self._gen_task_id()
+                if layerwise_transfer:
+                    if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                        flexkv_logger.warning("layerwise transfer is not enabled")
+                        layerwise_transfer = False
+                    elif not all_get:
+                        flexkv_logger.warning("only support layerwise get")
+                        layerwise_transfer = False
+                batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
+                batch_task_graph = self.merge_to_batch_kvtask(
+                    batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
+                )
+                transfer_graphs = [batch_task_graph]
+                self.tasks[batch_id].status = TaskStatus.RUNNING
+                task_ids = [batch_id]
+            else:
+                transfer_graphs = []
+                for task_id in task_ids:
+                    transfer_graph = self.check_task_ready(task_id)
+                    if transfer_graph is not None and transfer_graph.num_ops > 0:
+                        transfer_graphs.append(transfer_graph)
+        finally:
+            torch.cuda.nvtx.range_pop()
 
         # Submit all graphs in batch to reduce IPC overhead
         if transfer_graphs:
-            for transfer_handle in self.transfer_handles:
-                transfer_handle.submit_batch(transfer_graphs)
+            torch.cuda.nvtx.range_push("flexkv.onboard.scheduler.submit_graphs")
+            try:
+                for transfer_handle in self.transfer_handles:
+                    transfer_handle.submit_batch(transfer_graphs)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
         nvtx.end_range(nvtx_range)
         return task_ids

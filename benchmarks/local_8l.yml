@@ -1,0 +1,10 @@
+num_layers: 8
+num_kv_heads: 4
+head_size: 256
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 32
+cpu_cache_gb: 16
+enable_gds: false

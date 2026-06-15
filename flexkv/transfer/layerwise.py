@@ -493,42 +493,52 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             indexer_ssd_block_ids_tensor = ssd_block_ids
             indexer_cpu_block_ids_d2h_tensor = cpu_block_ids_d2h
 
-        self.layerwise_transfer_group.layerwise_transfer(
-            ssd_block_ids,
-            cpu_block_ids_d2h,
-            self.ssd_layer_stride_in_bytes,
-            self.ssd_kv_stride_in_bytes,
-            self.num_blocks_per_file,
-            self.round_robin,
-            32,  # num_threads_per_device
-            dst_block_ids_h2d,
-            src_block_ids_h2d,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.cpu_chunk_size_in_bytes,
-            self.h2d_cpu_kv_stride_in_bytes,
-            self.h2d_cpu_layer_stride_in_bytes,
-            self.cpu_tp_stride_in_bytes,
-            self.h2d_cta_num,
-            self.use_ce_transfer_h2d,
-            self.num_layers,
-            1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
-            self.is_mla,
-            counter_id,
-            indexer_gpu_block_id_tensor,
-            indexer_cpu_block_id_tensor,
-            self.indexer_cpu_block_stride_in_bytes,
-            self.indexer_cpu_layer_stride_in_bytes,
-            self.indexer_h2d_cpu_kv_stride_in_bytes,
-            self.indexer_h2d_cpu_layer_stride_in_bytes,
-            indexer_ssd_block_ids_tensor,
-            indexer_cpu_block_ids_d2h_tensor,
-            self.indexer_ssd_layer_stride_in_bytes,
-            self.indexer_ssd_kv_stride_in_bytes,
-            self.indexer_cpu_chunk_size_in_bytes,
-            self.indexer_num_blocks_per_file,
+        torch.cuda.nvtx.range_push(
+            "flexkv.onboard.layerwise.transfer_group"
+            f".h2d_blocks={len(src_block_ids_h2d)}"
+            f".disk2h_blocks={len(ssd_block_ids)}"
+            f".layers={self.num_layers}"
+            f".counter={counter_id}"
         )
+        try:
+            self.layerwise_transfer_group.layerwise_transfer(
+                ssd_block_ids,
+                cpu_block_ids_d2h,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,  # num_threads_per_device
+                dst_block_ids_h2d,
+                src_block_ids_h2d,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_chunk_size_in_bytes,
+                self.h2d_cpu_kv_stride_in_bytes,
+                self.h2d_cpu_layer_stride_in_bytes,
+                self.cpu_tp_stride_in_bytes,
+                self.h2d_cta_num,
+                self.use_ce_transfer_h2d,
+                self.num_layers,
+                1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
+                self.is_mla,
+                counter_id,
+                indexer_gpu_block_id_tensor,
+                indexer_cpu_block_id_tensor,
+                self.indexer_cpu_block_stride_in_bytes,
+                self.indexer_cpu_layer_stride_in_bytes,
+                self.indexer_h2d_cpu_kv_stride_in_bytes,
+                self.indexer_h2d_cpu_layer_stride_in_bytes,
+                indexer_ssd_block_ids_tensor,
+                indexer_cpu_block_ids_d2h_tensor,
+                self.indexer_ssd_layer_stride_in_bytes,
+                self.indexer_ssd_kv_stride_in_bytes,
+                self.indexer_cpu_chunk_size_in_bytes,
+                self.indexer_num_blocks_per_file,
+            )
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
