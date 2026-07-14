@@ -16,6 +16,7 @@
  */
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <vector>
 
 #include "transfer.cuh"
 
@@ -105,34 +106,72 @@ void transfer_kv_blocks(
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
 
-  // CE transfer mode (Copy Engine using cudaMemcpyAsync)
+  // CE transfer mode (Copy Engine using batched memcpy).
   if (use_ce_transfer) {
     int kv_dim = is_mla ? 1 : 2;
+    int num_copies = num_layers * kv_dim * num_blocks;
+    std::vector<void *> dsts;
+    std::vector<const void *> srcs;
+    std::vector<size_t> sizes;
+    dsts.reserve(num_copies);
+    srcs.reserve(num_copies);
+    sizes.reserve(num_copies);
+
     for (int i = 0; i < num_layers; i++) {
+      int layer_idx = start_layer_id + i;
       for (int j = 0; j < kv_dim; j++) {
         for (int k = 0; k < num_blocks; k++) {
           int64_t gpu_block_idx = gpu_block_ids[k];
           int64_t cpu_block_idx = cpu_block_ids[k];
 
           int64_t *cpu_chunk_ptr =
-              cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
+              cpu_ptr_int64 + layer_idx * cpu_layer_stride_int64 +
               j * cpu_kv_stride_int64 + cpu_block_idx * cpu_block_stride_int64 +
               cpu_startoff_inside_chunks_int64;
 
           int64_t *gpu_ptr =
-              ptr_at<Type>(gpu_tensor_handler, i, j, gpu_block_idx);
+              ptr_at<Type>(gpu_tensor_handler, layer_idx, j, gpu_block_idx);
           int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
                                    gpu_startoff_inside_chunks_int64;
 
           if (is_host_to_device) {
-            cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, chunk_size_in_bytes,
-                            cudaMemcpyHostToDevice, stream);
+            dsts.push_back(gpu_chunk_ptr);
+            srcs.push_back(cpu_chunk_ptr);
           } else {
-            cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
-                            cudaMemcpyDeviceToHost, stream);
+            dsts.push_back(cpu_chunk_ptr);
+            srcs.push_back(gpu_chunk_ptr);
           }
+          sizes.push_back(static_cast<size_t>(chunk_size_in_bytes));
+
+          // Original per-chunk CE path:
+          //
+          // if (is_host_to_device) {
+          //   cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, chunk_size_in_bytes,
+          //                   cudaMemcpyHostToDevice, stream);
+          // } else {
+          //   cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
+          //                   cudaMemcpyDeviceToHost, stream);
+          // }
         }
       }
+    }
+
+    if (!dsts.empty()) {
+      cudaMemcpyAttributes attr = {};
+      attr.srcLocHint.type =
+          is_host_to_device ? cudaMemLocationTypeHost : cudaMemLocationTypeDevice;
+      attr.dstLocHint.type =
+          is_host_to_device ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost;
+      attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+
+    cudaMemcpyAttributes attrs[] = {attr};
+    std::vector<size_t> attrs_idxs(dsts.size(), 0);
+    cudaError_t err = cudaMemcpyBatchAsync(
+        dsts.data(), srcs.data(), sizes.data(), dsts.size(), attrs,
+        attrs_idxs.data(), 1, stream);
+
+      TORCH_CHECK(err == cudaSuccess,
+                  "cudaMemcpyBatchAsync failed: ", cudaGetErrorString(err));
     }
   } else {
     // Custom kernel transfer
