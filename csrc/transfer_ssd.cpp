@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <cstdlib>
 #include <cstring>
 #include <limits.h>
 #include <torch/extension.h>
@@ -58,7 +59,7 @@ static void transfer_blocks_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_files_per_device, bool is_read, int kv_dim,
+    int64_t ssd_base_offset_in_bytes, int num_files_per_device, bool is_read, int kv_dim,
     bool ssd_io_opt, bool enable_block_first_transfer, IOCallable &do_io,
     IOVecCallable &do_iov) {
   if (end_block <= start_block) return;
@@ -75,6 +76,7 @@ static void transfer_blocks_impl(
                       block_stride_in_bytes * cpu_block_id +
                       start_layer * cpu_layer_stride_in_bytes;
       int64_t ssd_off = ssd_block_id * block_stride_in_bytes +
+                        ssd_base_offset_in_bytes +
                         start_layer * ssd_layer_stride_in_bytes;
       do_io(fd, cpu_ptr, ssd_off, layers_size, is_read);
     }
@@ -109,6 +111,7 @@ static void transfer_blocks_impl(
                         kv * cpu_kv_stride_in_bytes +
                         lid * cpu_layer_stride_in_bytes;
         int64_t ssd_off = ssd_bid * block_stride_in_bytes +
+                          ssd_base_offset_in_bytes +
                           kv * ssd_kv_stride_in_bytes +
                           lid * ssd_layer_stride_in_bytes;
         do_io(fd, cpu_ptr, ssd_off, batch_size, is_read);
@@ -160,6 +163,7 @@ static void transfer_blocks_impl(
         for (auto &seg : segments) {
           int fd = fd_list[seg.fd_idx];
           int64_t ssd_off = (int64_t)seg.infile_start * block_stride_in_bytes +
+                            ssd_base_offset_in_bytes +
                             kv * ssd_kv_stride_in_bytes +
                             lid * ssd_layer_stride_in_bytes;
 
@@ -188,6 +192,7 @@ static void transfer_blocks_impl(
     ssd_block_id /= num_files_per_device;
     for (int lid = start_layer; lid < end_layer; lid++) {
       int64_t ssd_k_block_offset = ssd_block_id * block_stride_in_bytes +
+                                   ssd_base_offset_in_bytes +
                                    lid * ssd_layer_stride_in_bytes;
       int64_t ssd_v_block_offset = ssd_k_block_offset + ssd_kv_stride_in_bytes;
       int64_t cpu_k_block_offset = cpu_block_id * block_stride_in_bytes +
@@ -318,7 +323,7 @@ void transfer_kv_blocks_ssd(
     int64_t ssd_kv_stride_in_bytes,    // in single file
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
     int num_blocks_per_file, int round_robin, int num_threads_per_device,
-    int kv_dim, bool ssd_io_opt) {
+    int kv_dim, bool ssd_io_opt, int64_t ssd_base_offset_in_bytes) {
   const int num_devices = ioctx.get_num_devices();
   const int num_files_per_device = ioctx.get_num_files_per_device();
 
@@ -336,13 +341,16 @@ void transfer_kv_blocks_ssd(
   auto is_4k_aligned = [](int64_t v) -> bool { return v % 4096 == 0; };
   const bool base_aligned =
       (static_cast<uintptr_t>(cpu_tensor_ptr) % 4096 == 0);
+  const bool ssd_base_aligned = is_4k_aligned(ssd_base_offset_in_bytes);
   bool is_direct;
   if (enable_block_first_transfer) {
-    is_direct = base_aligned && is_4k_aligned(block_stride_in_bytes) &&
+    is_direct = base_aligned && ssd_base_aligned &&
+                is_4k_aligned(block_stride_in_bytes) &&
                 is_4k_aligned(cpu_layer_stride_in_bytes) &&
                 is_4k_aligned(ssd_layer_stride_in_bytes);
   } else {
-    is_direct = base_aligned && is_4k_aligned(block_stride_in_bytes) &&
+    is_direct = base_aligned && ssd_base_aligned &&
+                is_4k_aligned(block_stride_in_bytes) &&
                 is_4k_aligned(chunk_size_in_bytes) &&
                 is_4k_aligned(cpu_layer_stride_in_bytes) &&
                 is_4k_aligned(ssd_layer_stride_in_bytes) &&
@@ -350,6 +358,64 @@ void transfer_kv_blocks_ssd(
                  (is_4k_aligned(cpu_kv_stride_in_bytes) &&
                   is_4k_aligned(ssd_kv_stride_in_bytes)));
   }
+  const char *force_buffered_env =
+      std::getenv("FLEXKV_FORCE_BUFFERED_SSD_IO");
+  const bool force_buffered =
+      force_buffered_env != nullptr &&
+      std::strcmp(force_buffered_env, "0") != 0 &&
+      std::strcmp(force_buffered_env, "false") != 0 &&
+      std::strcmp(force_buffered_env, "False") != 0;
+  is_direct = is_direct && !force_buffered;
+  unsigned int fallback_reason_mask = 0;
+  if (!base_aligned) fallback_reason_mask |= 1u << 0;
+  if (!ssd_base_aligned) fallback_reason_mask |= 1u << 1;
+  if (!is_4k_aligned(block_stride_in_bytes))
+    fallback_reason_mask |= 1u << 2;
+  if (!enable_block_first_transfer &&
+      !is_4k_aligned(chunk_size_in_bytes))
+    fallback_reason_mask |= 1u << 3;
+  if (!is_4k_aligned(cpu_layer_stride_in_bytes))
+    fallback_reason_mask |= 1u << 4;
+  if (!is_4k_aligned(ssd_layer_stride_in_bytes))
+    fallback_reason_mask |= 1u << 5;
+  if (!enable_block_first_transfer && kv_dim != 1 &&
+      !is_4k_aligned(cpu_kv_stride_in_bytes))
+    fallback_reason_mask |= 1u << 6;
+  if (!enable_block_first_transfer && kv_dim != 1 &&
+      !is_4k_aligned(ssd_kv_stride_in_bytes))
+    fallback_reason_mask |= 1u << 7;
+  if (force_buffered) fallback_reason_mask |= 1u << 8;
+
+  const int64_t estimated_bytes =
+      enable_block_first_transfer
+          ? static_cast<int64_t>(num_blocks) * num_layers *
+                cpu_layer_stride_in_bytes
+          : static_cast<int64_t>(num_blocks) * num_layers * kv_dim *
+                chunk_size_in_bytes;
+  FLEXKV_LOG_INFO(
+      "operation=ssd_io_path act=select direction=%s path=%s "
+      "estimated_bytes=%lld block_first=%d forced_buffered=%d "
+      "alignment_bytes=4096 fallback_reason_mask=%u "
+      "num_blocks=%d num_layers=%d kv_dim=%d "
+      "cpu_ptr_mod4096=%llu "
+      "ssd_base_mod4096=%lld block_stride_mod4096=%lld "
+      "chunk_size_mod4096=%lld cpu_layer_stride_mod4096=%lld "
+      "ssd_layer_stride_mod4096=%lld cpu_kv_stride_mod4096=%lld "
+      "ssd_kv_stride_mod4096=%lld",
+      is_read ? "SSD2H" : "H2SSD", is_direct ? "direct" : "buffered",
+      static_cast<long long>(estimated_bytes),
+      enable_block_first_transfer ? 1 : 0,
+      force_buffered ? 1 : 0,
+      fallback_reason_mask, num_blocks, num_layers, kv_dim,
+      static_cast<unsigned long long>(
+          static_cast<uintptr_t>(cpu_tensor_ptr) % 4096),
+      static_cast<long long>(ssd_base_offset_in_bytes % 4096),
+      static_cast<long long>(block_stride_in_bytes % 4096),
+      static_cast<long long>(chunk_size_in_bytes % 4096),
+      static_cast<long long>(cpu_layer_stride_in_bytes % 4096),
+      static_cast<long long>(ssd_layer_stride_in_bytes % 4096),
+      static_cast<long long>(cpu_kv_stride_in_bytes % 4096),
+      static_cast<long long>(ssd_kv_stride_in_bytes % 4096));
 
   std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
 
@@ -442,7 +508,8 @@ void transfer_kv_blocks_ssd(
               start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
-              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
+              chunk_size_in_bytes, block_stride_in_bytes,
+              ssd_base_offset_in_bytes, num_files_per_device,
               is_read, kv_dim, ssd_io_opt,
               enable_block_first_transfer, do_io, do_iov);
           iouring.submit();  // flush SQEs
@@ -457,6 +524,7 @@ void transfer_kv_blocks_ssd(
              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
+             ssd_base_offset_in_bytes,
              is_read, kv_dim, ssd_io_opt,
              enable_block_first_transfer,
              prom = std::move(prom)]() mutable {
@@ -480,7 +548,8 @@ void transfer_kv_blocks_ssd(
                     cpu_tensor_ptr, cpu_layer_stride_in_bytes,
                     ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
                     ssd_kv_stride_in_bytes, chunk_size_in_bytes,
-                    block_stride_in_bytes, num_files_per_device, is_read,
+                    block_stride_in_bytes, ssd_base_offset_in_bytes,
+                    num_files_per_device, is_read,
                     kv_dim, ssd_io_opt,
                     enable_block_first_transfer, do_io, do_iov);
                 prom.set_value(nullptr);

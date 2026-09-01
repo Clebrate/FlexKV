@@ -1659,7 +1659,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 is_read,
                 self.num_blocks_per_file,
                 self.round_robin,
-                32,
+                GLOBAL_CONFIG_FROM_ENV.ssd_threads_per_device,
                 True,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
@@ -1681,7 +1681,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 is_read,
                 self.num_blocks_per_file,
                 self.round_robin,
-                32,
+                GLOBAL_CONFIG_FROM_ENV.ssd_threads_per_device,
                 self.kv_dim,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
@@ -3630,7 +3630,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 True,
                 self.num_blocks_per_file,
                 self.round_robin,
-                32,
+                GLOBAL_CONFIG_FROM_ENV.ssd_threads_per_device,
                 self.kv_dim,
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )

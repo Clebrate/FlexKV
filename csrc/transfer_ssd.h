@@ -330,6 +330,7 @@ void transfer_kv_blocks_ssd(
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
     int round_robin = 1, int num_threads_per_device = 16,
-    int kv_dim = 2, bool ssd_io_opt = true);
+    int kv_dim = 2, bool ssd_io_opt = true,
+    int64_t ssd_base_offset_in_bytes = 0);
 
 } // namespace flexkv

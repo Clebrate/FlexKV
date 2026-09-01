@@ -955,7 +955,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 cpu_block_ids_d2h=cpu_block_ids_d2h,
                 num_blocks_per_file=self.num_blocks_per_file,
                 round_robin=self.round_robin,
-                num_threads_per_device=32,
+                num_threads_per_device=GLOBAL_CONFIG_FROM_ENV.ssd_threads_per_device,
                 gpu_block_id_tensor=dst_block_ids_h2d,
                 cpu_block_id_tensor=src_block_ids_h2d,
                 transfer_cta_num=self.h2d_cta_num,
@@ -977,7 +977,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.ssd_kv_stride_in_bytes,
             self.num_blocks_per_file,
             self.round_robin,
-            32,  # num_threads_per_device
+            GLOBAL_CONFIG_FROM_ENV.ssd_threads_per_device,
             dst_block_ids_h2d,
             src_block_ids_h2d,
             self.cpu_kv_stride_in_bytes,

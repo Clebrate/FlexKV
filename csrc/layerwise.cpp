@@ -1,6 +1,8 @@
 #include "layerwise.h"
 #include "logging.h"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
@@ -9,6 +11,12 @@
 #include <unistd.h>
 
 namespace flexkv {
+
+static bool three_pipeline_enabled() {
+  const char *value = std::getenv("FLEXKV_ENABLE_THREE_PIPELINE");
+  return value != nullptr && std::string(value) != "0" &&
+         std::string(value) != "false" && std::string(value) != "False";
+}
 
 // ===== Event polling notification (#199) =====
 
@@ -1369,9 +1377,21 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     swa_cpu_block_ids = static_cast<int64_t *>(swa_h2d_src.data_ptr());
   }
 
+  // The experimental three-stage mode reads one original layer immediately
+  // before launching that layer's H2D. Since H2D is asynchronous and attention
+  // is released by eventfd, the next SSD read can overlap both downstream
+  // stages. Sidecar layouts retain the all-at-once path until they gain the
+  // same per-layer readiness semantics.
+  const bool three_pipeline =
+      three_pipeline_enabled() && !has_swa_ && enable_ssd_ &&
+      ssd_block_ids.numel() > 0;
+  const auto three_pipeline_start = std::chrono::steady_clock::now();
+  int64_t three_pipeline_bytes = 0;
+
   // Step 0a: main-KV SSD -> CPU (opaque multi-group block).
-  if (enable_ssd_ && ssd_block_ids.numel() > 0) {
+  if (enable_ssd_ && ssd_block_ids.numel() > 0 && !three_pipeline) {
     const int64_t block_stride = groups_[0].cpu_block_stride;
+    const auto disk2h_start = std::chrono::steady_clock::now();
     char ssd_range_name[128];
     snprintf(ssd_range_name, sizeof(ssd_range_name),
              "SSD->CPU MultiGroup Blocks (%lld blocks, %.2fMB each)",
@@ -1391,9 +1411,23 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         /*chunk_size_in_bytes=*/block_stride,
         /*block_stride_in_bytes=*/block_stride,
         /*is_read=*/true, num_blocks_per_file, round_robin,
-        num_threads_per_device, kv_dim,
+        num_threads_per_device,
+        /*kv_dim=*/1,
         /*ssd_io_opt=*/ssd_io_opt_);
     nvtxRangePop();
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      disk2h_start)
+            .count();
+    const double gib =
+        static_cast<int64_t>(ssd_block_ids.numel()) * block_stride /
+        (1024.0 * 1024.0 * 1024.0);
+    FLEXKV_LOG_INFO(
+        "operation=transfer act=complete status=success direction=DISK2H "
+        "blocks=%lld mode=layerwise-all-layers data_size=%.6fGB "
+        "transfer_time=%.4fs bandwidth=%.2fGB/s",
+        static_cast<long long>(ssd_block_ids.numel()), gib, seconds,
+        seconds > 0.0 ? gib / seconds : 0.0);
   }
 
   // Step 0b: SWA SSD -> CPU.
@@ -1518,6 +1552,33 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
 
+    if (three_pipeline && !members.empty()) {
+      char range_name[160];
+      snprintf(range_name, sizeof(range_name),
+               "SSD->CPU OrigLayer[%d] members=%zu", orig, members.size());
+      nvtxRangePushA(range_name);
+      for (const auto &member : members) {
+        const GroupParams &gp = groups_[member.first];
+        const int local_id = member.second;
+        torch::Tensor layer_id = torch::full(
+            {1}, local_id, torch::TensorOptions().dtype(torch::kInt32));
+        transfer_kv_blocks_ssd(
+            *ioctx_, layer_id,
+            reinterpret_cast<int64_t>(
+                static_cast<char *>(cpu_blocks_) + gp.cpu_offset_bytes),
+            ssd_block_ids, cpu_block_ids_d2h, gp.cpu_layer_stride,
+            gp.cpu_kv_stride, gp.ssd_layer_stride, gp.ssd_kv_stride,
+            gp.chunk_size, gp.cpu_block_stride,
+            /*is_read=*/true, num_blocks_per_file, round_robin,
+            num_threads_per_device, kv_dim,
+            /*ssd_io_opt=*/ssd_io_opt_,
+            /*ssd_base_offset_in_bytes=*/gp.ssd_offset_bytes);
+        three_pipeline_bytes +=
+            static_cast<int64_t>(num_blocks) * gp.cpu_layer_stride;
+      }
+      nvtxRangePop();
+    }
+
     if (mg_trace) {
       for (int d = 0; d < num_gpus_; ++d) {
         cudaSetDevice(gpu_device_ids_[d]);
@@ -1629,6 +1690,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
                           next_id_ptr,
                           /*callbacks_per_gpu=*/slots_per_gpu);
     }
+  }
+
+  if (three_pipeline) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      three_pipeline_start)
+            .count();
+    const double gib =
+        three_pipeline_bytes / (1024.0 * 1024.0 * 1024.0);
+    FLEXKV_LOG_INFO(
+        "operation=transfer act=complete status=success direction=DISK2H "
+        "blocks=%d mode=three-pipeline data_size=%.6fGB transfer_time=%.4fs "
+        "bandwidth=%.2fGB/s",
+        num_blocks, gib, seconds, seconds > 0.0 ? gib / seconds : 0.0);
   }
 
   if (notify_mode_ == NotifyMode::POLLING && !work_origs.empty()) {
