@@ -1523,7 +1523,10 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   }
   if (!work_origs.empty()) {
     int first = work_origs.front();
-    h2d_range_ids[first] = nvtxRangeStartA(h2d_range_names[first].c_str());
+    if (!three_pipeline) {
+      h2d_range_ids[first] =
+          nvtxRangeStartA(h2d_range_names[first].c_str());
+    }
   }
 
   const bool mg_trace = enable_trace &&
@@ -1577,6 +1580,15 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
             static_cast<int64_t>(num_blocks) * gp.cpu_layer_stride;
       }
       nvtxRangePop();
+    }
+
+    // In three-stage mode the H2D range starts only after this layer's SSD
+    // read has completed. The existing stream callback ends it when H2D
+    // completes, so the range measures H2D queue-to-completion wall time
+    // without including SSD latency.
+    if (three_pipeline) {
+      h2d_range_ids[orig] =
+          nvtxRangeStartA(h2d_range_names[orig].c_str());
     }
 
     if (mg_trace) {
@@ -1676,10 +1688,12 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
 
     bool is_last_active = (ai + 1 == work_origs.size());
     int next_orig = is_last_active ? -1 : work_origs[ai + 1];
-    const char *next_name =
-        is_last_active ? nullptr : h2d_range_names[next_orig].c_str();
+    const char *next_name = (is_last_active || three_pipeline)
+                                ? nullptr
+                                : h2d_range_names[next_orig].c_str();
     nvtxRangeId_t *next_id_ptr =
-        is_last_active ? nullptr : &h2d_range_ids[next_orig];
+        (is_last_active || three_pipeline) ? nullptr
+                                          : &h2d_range_ids[next_orig];
 
     if (notify_mode_ == NotifyMode::HOSTFUNC) {
       int swa_slots = swa_slots_for_orig_(orig, swa_active);
