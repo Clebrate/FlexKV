@@ -539,7 +539,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_blockfirst") = false,
            py::arg("num_kv_heads") = 1,
            py::arg("ce_gather_threads") = 4,
-           py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
+           py::arg("ce_gather_nt") = true,
+           py::arg("ssd_io_opt") = true)
       .def(py::init([](
           int num_gpus,
           const std::vector<std::vector<std::vector<torch::Tensor>>>
@@ -632,7 +633,8 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("is_blockfirst") = false,
           py::arg("num_kv_heads") = 1,
           py::arg("ce_gather_threads") = 4,
-          py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
+          py::arg("ce_gather_nt") = true,
+          py::arg("ssd_io_opt") = true)
       .def("init_swa_multi_group",
            &flexkv::LayerwiseTransferGroup::init_swa_multi_group,
            py::arg("swa_gpu_blocks_per_group"), py::arg("swa_cpu_blocks"),

@@ -1199,6 +1199,50 @@ void ce_transfer_gather_direct(
   // Device staging: [num_blocks, total_iters, elems_per_block] (BLOCKFIRST)
   const size_t total_dev_bytes = buf_bytes * (size_t)total_iters;
 
+  // BLOCKFIRST CPU -> LAYERFIRST GPU can be expressed directly as a 2D copy:
+  // each row is one block's current (layer, kv) chunk, source pitch is the
+  // complete CPU block, and destination pitch is the GPU block stride.  Split
+  // at logical discontinuities so both the CPU and GPU IDs remain consecutive
+  // inside every copy.  This avoids device staging, 256 per-block CUDA calls,
+  // and the ATen D2D transpose used by the portable path.
+  if (is_host_to_device && ce_config.enable_memcpy2d) {
+    for (int64_t it = 0; it < total_iters; ++it) {
+      int i = static_cast<int>(it / kv_dim);
+      int j = static_cast<int>(it % kv_dim);
+      int64_t *gpu_ptr_block0 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
+      int64_t *gpu_ptr_block1 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 1);
+      const size_t gpu_pitch =
+          static_cast<size_t>((char *)gpu_ptr_block1 -
+                              (char *)gpu_ptr_block0);
+      const size_t cpu_pitch =
+          static_cast<size_t>(cpu_block_stride_int64) * sizeof(int64_t);
+      int64_t *gpu_layer_kv_base =
+          gpu_ptr_block0 + gpu_startoff_inside_chunks_int64;
+      const int64_t *cpu_layer_kv_base =
+          cpu_ptr_int64 +
+          (i + start_layer_id) * cpu_layer_stride_int64 +
+          j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+
+      for (const auto &seg : ce_analysis.segments) {
+        const int64_t gpu_block = gpu_block_ids[seg.start_k];
+        const int64_t cpu_block = cpu_block_ids[seg.start_k];
+        void *dst = reinterpret_cast<char *>(gpu_layer_kv_base) +
+                    gpu_block * gpu_pitch;
+        const void *src = reinterpret_cast<const char *>(cpu_layer_kv_base) +
+                          cpu_block * cpu_pitch;
+        cudaMemcpy2DAsync(
+            dst, gpu_pitch, src, cpu_pitch, chunk_size_in_bytes,
+            static_cast<size_t>(seg.nr_blocks), cudaMemcpyHostToDevice, stream);
+        FLEXKV_GPU_CPU_TRANSFER(
+            true, chunk_size_in_bytes * static_cast<size_t>(seg.nr_blocks));
+      }
+    }
+    cudaStreamSynchronize(stream);
+    return;
+  }
+
   // Bind ATen to our cuda stream
   int cur_dev = 0;
   cudaGetDevice(&cur_dev);

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, NewType, Optional
@@ -67,6 +68,17 @@ class SequenceMeta:
         self._namespace = namespace
 
         self.gen_hashes()
+        log_alignment = os.getenv("FLEXKV_LOG_TOKEN_ALIGNMENT", "0")
+        if log_alignment not in {"0", "false", "False"}:
+            print(
+                "[FlexKV-PAGE] operation=token_page_alignment "
+                f"input_tokens={len(self.token_ids)} "
+                f"tokens_per_block={self.tokens_per_block} "
+                f"full_blocks={self.num_blocks} "
+                f"aligned_tokens={self.num_blocks * self.tokens_per_block} "
+                f"tail_tokens_dropped={len(self.token_ids) % self.tokens_per_block}",
+                flush=True,
+            )
 
     @property
     def num_blocks(self) -> int:

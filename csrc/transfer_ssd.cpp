@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits.h>
@@ -416,6 +417,20 @@ void transfer_kv_blocks_ssd(
       static_cast<long long>(ssd_layer_stride_in_bytes % 4096),
       static_cast<long long>(cpu_kv_stride_in_bytes % 4096),
       static_cast<long long>(ssd_kv_stride_in_bytes % 4096));
+  // Standalone c_ext probes may replace the native spdlog sink. Keep this
+  // critical path decision visible in their captured stdout as well.
+  std::fprintf(
+      stdout,
+      "[FLEXKV-IO-PATH] direction=%s path=%s forced_buffered=%d "
+      "fallback_reason_mask=%u chunk_size_mod4096=%lld "
+      "block_stride_mod4096=%lld cpu_ptr_mod4096=%llu\n",
+      is_read ? "SSD2H" : "H2SSD", is_direct ? "direct" : "buffered",
+      force_buffered ? 1 : 0, fallback_reason_mask,
+      static_cast<long long>(chunk_size_in_bytes % 4096),
+      static_cast<long long>(block_stride_in_bytes % 4096),
+      static_cast<unsigned long long>(
+          static_cast<uintptr_t>(cpu_tensor_ptr) % 4096));
+  std::fflush(stdout);
 
   std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
 

@@ -1566,6 +1566,79 @@ def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_na
                                 block, kv, hd_idx, exp, act)
 
 
+def test_ce_direct2d_hostfunc_layerwise_correctness():
+    """Direct 2D and portable CE paths preserve layerwise correctness."""
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = (4, 16, 16, 8, 128)
+    kv_dim = 2
+    num_kv_heads = num_heads
+    num_gpus = NUM_GPUS
+    mode = "sharded"
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        "BLOCKFIRST", kv_dim, num_kv_heads, num_gpus)
+    all_gpu = [
+        make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank,
+                         head_dim, kv_dim, g)
+        for g in range(num_gpus)
+    ]
+    for g in range(num_gpus):
+        fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = make_block_id_pattern("scattered", num_blocks)
+
+    tp = make_tp_group(
+        cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+        is_blockfirst=True)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads, kv_shared_across_ranks_mode=mode,
+    )
+    sync_all(num_gpus)
+    del tp
+
+    for enable_memcpy2d in (False, True):
+        for pattern in ("contiguous", "scattered"):
+            read_ids = make_block_id_pattern(pattern, num_blocks)
+            for gpu_layers in all_gpu:
+                for layer in gpu_layers:
+                    layer.zero_()
+            sync_all(num_gpus)
+
+            layerwise_h2d_readback(
+                all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, read_ids,
+                cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+                gpu_layout.get_chunk_size() * ES, kv_dim, num_kv_heads, mode,
+                ce_path_opt=True, notify_mode="hostfunc", layer_granularity=1,
+                is_blockfirst=True, enable_memcpy2d=enable_memcpy2d)
+
+            for g in range(num_gpus):
+                for layer in range(num_layers):
+                    for block in (0, num_blocks // 2, num_blocks - 1):
+                        for kv in range(kv_dim):
+                            for hd_idx in (0, head_dim - 1):
+                                expected = expected_val(
+                                    g, layer, block, 0, hd_idx, kv)
+                                actual = all_gpu[g][layer][
+                                    kv, block, 0, 0, hd_idx].item()
+                                assert abs(actual - expected) < 1e-3, (
+                                    enable_memcpy2d, pattern)
+
+
 def _strategy_matrix():
     """Enumerate (threshold, pattern, layout, kv_dim, num_kv_heads, mode,
     direction, size) -> (strategy, variant) over exactly the swept parametrize

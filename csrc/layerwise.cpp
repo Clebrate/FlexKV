@@ -2,12 +2,17 @@
 #include "logging.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <fcntl.h>
+#include <future>
+#include <mutex>
 #include <nvtx3/nvToolsExt.h>
+#include <queue>
 #include <stdexcept>
 #include <sys/eventfd.h>
+#include <thread>
 #include <unistd.h>
 
 namespace flexkv {
@@ -17,6 +22,64 @@ static bool three_pipeline_enabled() {
   return value != nullptr && std::string(value) != "0" &&
          std::string(value) != "false" && std::string(value) != "False";
 }
+
+// A process-lifetime SSD read-ahead worker.  FlexKV's SSD submission state is
+// thread-local, so creating one std::async thread per layer repeatedly creates
+// and destroys io_uring state.  A persistent worker preserves that state while
+// still allowing the main transfer thread to submit H2D concurrently.
+class SSDReadAheadExecutor {
+public:
+  static SSDReadAheadExecutor &instance() {
+    static SSDReadAheadExecutor executor;
+    return executor;
+  }
+
+  std::future<int64_t> submit(std::packaged_task<int64_t()> task) {
+    std::future<int64_t> result = task.get_future();
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      tasks_.push(std::move(task));
+    }
+    cv_.notify_one();
+    return result;
+  }
+
+  ~SSDReadAheadExecutor() {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_one();
+    worker_.join();
+  }
+
+private:
+  SSDReadAheadExecutor() : worker_([this]() { run(); }) {}
+  SSDReadAheadExecutor(const SSDReadAheadExecutor &) = delete;
+  SSDReadAheadExecutor &operator=(const SSDReadAheadExecutor &) = delete;
+
+  void run() {
+    while (true) {
+      std::packaged_task<int64_t()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return stopping_ || !tasks_.empty(); });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop();
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<std::packaged_task<int64_t()>> tasks_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
 
 // ===== Event polling notification (#199) =====
 
@@ -1550,17 +1613,21 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     }
   }
 
-  for (size_t ai = 0; ai < work_origs.size(); ++ai) {
-    int orig = work_origs[ai];
-    const auto &members = layer_members_[orig];
-    int members_this_layer = static_cast<int>(members.size());
-
-    if (three_pipeline && !members.empty()) {
+  // Read one original layer into its own CPU region.  Keeping this operation
+  // in a callable lets the next layer's blocking SSD read run on a host
+  // read-ahead thread before CE submission for the current layer.  This
+  // guarantees SSD(i+1) can overlap H2D(i), even when a CUDA CE path performs
+  // host-side synchronization internally.
+  auto read_orig_layer = [&](int read_orig) -> int64_t {
+    const auto &read_members = layer_members_[read_orig];
+    int64_t bytes = 0;
+    if (!read_members.empty()) {
       char range_name[160];
       snprintf(range_name, sizeof(range_name),
-               "SSD->CPU OrigLayer[%d] members=%zu", orig, members.size());
+               "SSD->CPU OrigLayer[%d] members=%zu", read_orig,
+               read_members.size());
       nvtxRangePushA(range_name);
-      for (const auto &member : members) {
+      for (const auto &member : read_members) {
         const GroupParams &gp = groups_[member.first];
         const int local_id = member.second;
         torch::Tensor layer_id = torch::full(
@@ -1576,10 +1643,34 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
             num_threads_per_device, kv_dim,
             /*ssd_io_opt=*/ssd_io_opt_,
             /*ssd_base_offset_in_bytes=*/gp.ssd_offset_bytes);
-        three_pipeline_bytes +=
-            static_cast<int64_t>(num_blocks) * gp.cpu_layer_stride;
+        bytes += static_cast<int64_t>(num_blocks) * gp.cpu_layer_stride;
       }
       nvtxRangePop();
+    }
+    return bytes;
+  };
+
+  // Prime layer 0 synchronously.  Each following layer is read by the future
+  // started in the previous iteration.
+  std::future<int64_t> prefetched_layer;
+  if (three_pipeline && !work_origs.empty()) {
+    three_pipeline_bytes += read_orig_layer(work_origs.front());
+  }
+
+  for (size_t ai = 0; ai < work_origs.size(); ++ai) {
+    int orig = work_origs[ai];
+    const auto &members = layer_members_[orig];
+    int members_this_layer = static_cast<int>(members.size());
+
+    if (three_pipeline && ai > 0) {
+      three_pipeline_bytes += prefetched_layer.get();
+    }
+    if (three_pipeline && ai + 1 < work_origs.size()) {
+      const int next_read_orig = work_origs[ai + 1];
+      std::packaged_task<int64_t()> task(
+          [&, next_read_orig]() { return read_orig_layer(next_read_orig); });
+      prefetched_layer =
+          SSDReadAheadExecutor::instance().submit(std::move(task));
     }
 
     // In three-stage mode the H2D range starts only after this layer's SSD
