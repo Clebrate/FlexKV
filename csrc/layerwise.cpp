@@ -1,5 +1,6 @@
 #include "layerwise.h"
 #include "logging.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -21,6 +22,20 @@ static bool three_pipeline_enabled() {
   const char *value = std::getenv("FLEXKV_ENABLE_THREE_PIPELINE");
   return value != nullptr && std::string(value) != "0" &&
          std::string(value) != "false" && std::string(value) != "False";
+}
+
+// How many consecutive original layers one SSD call should pull from each
+// FlexKV block. Default 1 keeps today's 256KiB I/Os. 2/4/8 makes each I/O
+// 512KiB/1MiB/2MiB *inside* the 2MiB block (the bytes are contiguous on
+// disk), which is what actually fills this NVMe. First layer is still read
+// alone so HSTU(0) can start as soon as 256KiB is in CPU.
+static int three_pipeline_ssd_layer_batch() {
+  const char *value = std::getenv("FLEXKV_PIPELINE_SSD_LAYER_BATCH");
+  if (value == nullptr || value[0] == '\0') {
+    return 1;
+  }
+  int parsed = std::atoi(value);
+  return parsed < 1 ? 1 : parsed;
 }
 
 // A process-lifetime SSD read-ahead worker.  FlexKV's SSD submission state is
@@ -1650,11 +1665,91 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     return bytes;
   };
 
-  // Prime layer 0 synchronously.  Each following layer is read by the future
-  // started in the previous iteration.
+  // Read [begin_ai, begin_ai+count) original layers. Consecutive local ids
+  // in one group become one block-first I/O of count*256KiB per block.
+  auto read_orig_layer_span = [&](size_t begin_ai, size_t count) -> int64_t {
+    if (count <= 1) {
+      return read_orig_layer(work_origs[begin_ai]);
+    }
+    const int first_orig = work_origs[begin_ai];
+    const auto &first_members = layer_members_[first_orig];
+    if (first_members.size() != 1) {
+      int64_t bytes = 0;
+      for (size_t j = 0; j < count; ++j) {
+        bytes += read_orig_layer(work_origs[begin_ai + j]);
+      }
+      return bytes;
+    }
+    const int group_idx = first_members.front().first;
+    const int first_local = first_members.front().second;
+    for (size_t k = 1; k < count; ++k) {
+      const auto &members = layer_members_[work_origs[begin_ai + k]];
+      if (members.size() != 1 || members.front().first != group_idx ||
+          members.front().second != first_local + static_cast<int>(k)) {
+        int64_t bytes = 0;
+        for (size_t j = 0; j < count; ++j) {
+          bytes += read_orig_layer(work_origs[begin_ai + j]);
+        }
+        return bytes;
+      }
+    }
+    const GroupParams &gp = groups_[group_idx];
+    torch::Tensor layer_ids = torch::arange(
+        first_local, first_local + static_cast<int>(count),
+        torch::TensorOptions().dtype(torch::kInt32));
+    char range_name[160];
+    snprintf(range_name, sizeof(range_name),
+             "SSD->CPU OrigLayer[%d,%d) members=1", first_orig,
+             first_orig + static_cast<int>(count));
+    nvtxRangePushA(range_name);
+    transfer_kv_blocks_ssd(
+        *ioctx_, layer_ids,
+        reinterpret_cast<int64_t>(static_cast<char *>(cpu_blocks_) +
+                                  gp.cpu_offset_bytes),
+        ssd_block_ids, cpu_block_ids_d2h, gp.cpu_layer_stride,
+        gp.cpu_kv_stride, gp.ssd_layer_stride, gp.ssd_kv_stride,
+        gp.chunk_size, gp.cpu_block_stride,
+        /*is_read=*/true, num_blocks_per_file, round_robin,
+        num_threads_per_device, kv_dim,
+        /*ssd_io_opt=*/ssd_io_opt_,
+        /*ssd_base_offset_in_bytes=*/gp.ssd_offset_bytes);
+    nvtxRangePop();
+    return static_cast<int64_t>(num_blocks) * gp.cpu_layer_stride *
+           static_cast<int64_t>(count);
+  };
+
+  const int ssd_layer_batch =
+      three_pipeline
+          ? std::max(1, std::min(three_pipeline_ssd_layer_batch(),
+                                 std::max(1, static_cast<int>(work_origs.size()))))
+          : 1;
   std::future<int64_t> prefetched_layer;
+  size_t ssd_ready_until = 0;
+  size_t prefetch_begin = 0;
+  size_t prefetch_count = 0;
+  size_t next_ssd_ai = 0;
+
+  auto submit_ssd_span = [&](size_t begin_ai, size_t count) {
+    prefetch_begin = begin_ai;
+    prefetch_count = count;
+    std::packaged_task<int64_t()> task([&, begin_ai, count]() {
+      return read_orig_layer_span(begin_ai, count);
+    });
+    prefetched_layer = SSDReadAheadExecutor::instance().submit(std::move(task));
+    next_ssd_ai = begin_ai + count;
+  };
+
+  // Prime layer 0 synchronously so HSTU(0) is not delayed by a multi-layer
+  // SSD batch. Remaining layers are fetched in ssd_layer_batch-sized I/Os.
   if (three_pipeline && !work_origs.empty()) {
     three_pipeline_bytes += read_orig_layer(work_origs.front());
+    ssd_ready_until = 1;
+    next_ssd_ai = 1;
+    if (next_ssd_ai < work_origs.size()) {
+      const size_t count = std::min(static_cast<size_t>(ssd_layer_batch),
+                                    work_origs.size() - next_ssd_ai);
+      submit_ssd_span(next_ssd_ai, count);
+    }
   }
 
   for (size_t ai = 0; ai < work_origs.size(); ++ai) {
@@ -1662,15 +1757,14 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const auto &members = layer_members_[orig];
     int members_this_layer = static_cast<int>(members.size());
 
-    if (three_pipeline && ai > 0) {
+    if (three_pipeline && ai >= ssd_ready_until) {
       three_pipeline_bytes += prefetched_layer.get();
-    }
-    if (three_pipeline && ai + 1 < work_origs.size()) {
-      const int next_read_orig = work_origs[ai + 1];
-      std::packaged_task<int64_t()> task(
-          [&, next_read_orig]() { return read_orig_layer(next_read_orig); });
-      prefetched_layer =
-          SSDReadAheadExecutor::instance().submit(std::move(task));
+      ssd_ready_until = prefetch_begin + prefetch_count;
+      if (next_ssd_ai < work_origs.size()) {
+        const size_t count = std::min(static_cast<size_t>(ssd_layer_batch),
+                                      work_origs.size() - next_ssd_ai);
+        submit_ssd_span(next_ssd_ai, count);
+      }
     }
 
     // In three-stage mode the H2D range starts only after this layer's SSD
@@ -1806,9 +1900,10 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         three_pipeline_bytes / (1024.0 * 1024.0 * 1024.0);
     FLEXKV_LOG_INFO(
         "operation=transfer act=complete status=success direction=DISK2H "
-        "blocks=%d mode=three-pipeline data_size=%.6fGB transfer_time=%.4fs "
-        "bandwidth=%.2fGB/s",
-        num_blocks, gib, seconds, seconds > 0.0 ? gib / seconds : 0.0);
+        "blocks=%d mode=three-pipeline ssd_layer_batch=%d data_size=%.6fGB "
+        "transfer_time=%.4fs bandwidth=%.2fGB/s",
+        num_blocks, ssd_layer_batch, gib, seconds,
+        seconds > 0.0 ? gib / seconds : 0.0);
   }
 
   if (notify_mode_ == NotifyMode::POLLING && !work_origs.empty()) {
