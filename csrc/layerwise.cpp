@@ -27,8 +27,8 @@ static bool three_pipeline_enabled() {
 // How many consecutive original layers one SSD call should pull from each
 // FlexKV block. Default 1 keeps today's 256KiB I/Os. 2/4/8 makes each I/O
 // 512KiB/1MiB/2MiB *inside* the 2MiB block (the bytes are contiguous on
-// disk), which is what actually fills this NVMe. First layer is still read
-// alone so HSTU(0) can start as soon as 256KiB is in CPU.
+// disk). Layers are chunked evenly from layer 0; the last chunk may be
+// shorter.
 static int three_pipeline_ssd_layer_batch() {
   const char *value = std::getenv("FLEXKV_PIPELINE_SSD_LAYER_BATCH");
   if (value == nullptr || value[0] == '\0') {
@@ -1739,16 +1739,18 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     next_ssd_ai = begin_ai + count;
   };
 
-  // Prime layer 0 synchronously so HSTU(0) is not delayed by a multi-layer
-  // SSD batch. Remaining layers are fetched in ssd_layer_batch-sized I/Os.
+  // Fill the pipeline with the first even chunk, then prefetch the next
+  // chunk on the SSD worker so it overlaps H2D of the chunk already in CPU.
   if (three_pipeline && !work_origs.empty()) {
-    three_pipeline_bytes += read_orig_layer(work_origs.front());
-    ssd_ready_until = 1;
-    next_ssd_ai = 1;
+    const size_t count = std::min(static_cast<size_t>(ssd_layer_batch),
+                                  work_origs.size());
+    three_pipeline_bytes += read_orig_layer_span(0, count);
+    ssd_ready_until = count;
+    next_ssd_ai = count;
     if (next_ssd_ai < work_origs.size()) {
-      const size_t count = std::min(static_cast<size_t>(ssd_layer_batch),
-                                    work_origs.size() - next_ssd_ai);
-      submit_ssd_span(next_ssd_ai, count);
+      const size_t prefetch = std::min(static_cast<size_t>(ssd_layer_batch),
+                                       work_origs.size() - next_ssd_ai);
+      submit_ssd_span(next_ssd_ai, prefetch);
     }
   }
 
