@@ -111,6 +111,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"num_gpu_blocks={[len(b) for b in gpu_blocks]}, "
             f"multi_group={'yes' if layer_groups is not None else 'no'}")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self._eventfd_clients: List[socket.socket] = []
         assert len(gpu_blocks) == tp_group_size, f"len(gpu_blocks) = {len(gpu_blocks)}, tp_group_size = {tp_group_size}"
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         # Bind CUDA device before any CUDA API (host-register / IPC import).
@@ -266,35 +267,38 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.num_blocks_per_file = 0
             self.round_robin = 1
 
-        if self.has_multi_group:
-            self._init_multi_group(
-                cpu_kv_layout=cpu_kv_layout,
-                ssd_kv_layout=ssd_kv_layout,
-                ssd_files=ssd_files,
-                layer_groups=layer_groups,
-                gpu_blocks_per_group=gpu_blocks_per_group,
-                gpu_layouts_per_group=gpu_layouts_per_group,
-                cpu_blocks=cpu_blocks,
-                layer_eventfds_tensor=layer_eventfds_tensor,
-                tp_group_size=tp_group_size,
-            )
-        else:
-            self._init_single_group(
-                gpu_kv_layouts=gpu_kv_layouts,
-                cpu_kv_layout=cpu_kv_layout,
-                ssd_kv_layout=ssd_kv_layout,
-                ssd_files=ssd_files,
-                cpu_blocks=cpu_blocks,
-                layer_eventfds_tensor=layer_eventfds_tensor,
-                tp_group_size=tp_group_size,
-            )
+        try:
+            if self.has_multi_group:
+                self._init_multi_group(
+                    cpu_kv_layout=cpu_kv_layout,
+                    ssd_kv_layout=ssd_kv_layout,
+                    ssd_files=ssd_files,
+                    layer_groups=layer_groups,
+                    gpu_blocks_per_group=gpu_blocks_per_group,
+                    gpu_layouts_per_group=gpu_layouts_per_group,
+                    cpu_blocks=cpu_blocks,
+                    layer_eventfds_tensor=layer_eventfds_tensor,
+                    tp_group_size=tp_group_size,
+                )
+            else:
+                self._init_single_group(
+                    gpu_kv_layouts=gpu_kv_layouts,
+                    cpu_kv_layout=cpu_kv_layout,
+                    ssd_kv_layout=ssd_kv_layout,
+                    ssd_files=ssd_files,
+                    cpu_blocks=cpu_blocks,
+                    layer_eventfds_tensor=layer_eventfds_tensor,
+                    tp_group_size=tp_group_size,
+                )
 
-        self._bytes_per_block = getattr(self, "cpu_chunk_size_in_bytes", 0) * self.num_layers * self.kv_dim
+            self._bytes_per_block = getattr(self, "cpu_chunk_size_in_bytes", 0) * self.num_layers * self.kv_dim
 
-        if self.has_swa_multi_group:
-            self._bind_swa_multi_group(tp_group_size)
+            if self.has_swa_multi_group:
+                self._bind_swa_multi_group(tp_group_size)
 
-        flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
+            flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
+        finally:
+            self._complete_layer_ready_ipc_handoff()
 
     def _init_swa_strides(self) -> None:
         """Derive SWA byte strides (shared by single- and multi-group paths)."""
@@ -820,51 +824,55 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                     continue
 
                 try:
-                    with conn:
-                        # Receive 16-byte metadata: effective_tp_rank, effective_tp_size_per_node,
-                        # num_layers, num_counters
-                        metadata = conn.recv(16)
-                        if len(metadata) < 16:
-                            flexkv_logger.error(
-                                f"[LayerwiseWorker] Incomplete metadata on {socket_path}: "
-                                f"expected 16 bytes, got {len(metadata)}")
-                            continue
+                    # Keep the socket open after ACK so Recsys can receive CUDA
+                    # IPC event handles once LayerwiseTransferGroup is ready.
+                    metadata = conn.recv(16)
+                    if len(metadata) < 16:
+                        flexkv_logger.error(
+                            f"[LayerwiseWorker] Incomplete metadata on {socket_path}: "
+                            f"expected 16 bytes, got {len(metadata)}")
+                        conn.close()
+                        continue
 
-                        rank_key, effective_tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
-                            struct.unpack("iiii", metadata[:16])
+                    rank_key, effective_tp_size_per_node_recv, recv_num_layers, recv_num_counters = \
+                        struct.unpack("iiii", metadata[:16])
 
-                        if not all_rank_eventfds:
-                            num_layers, num_counters = recv_num_layers, recv_num_counters
+                    if not all_rank_eventfds:
+                        num_layers, num_counters = recv_num_layers, recv_num_counters
 
+                    flexkv_logger.debug(
+                        f"[LayerwiseWorker] Connection {conn_idx}: "
+                        f"effective_tp_rank={rank_key}, "
+                        f"effective_tp_size_per_node={effective_tp_size_per_node_recv}, "
+                        f"num_layers={recv_num_layers}, "
+                        f"num_counters={recv_num_counters}")
+
+                    rank_eventfds = {}
+                    for _ in range(recv_num_counters):
+                        fds, extra_data = _recv_fds(conn, recv_num_layers)
+                        counter_id = struct.unpack("i", extra_data[:4])[0]
+                        rank_eventfds[counter_id] = fds
                         flexkv_logger.debug(
-                            f"[LayerwiseWorker] Connection {conn_idx}: "
-                            f"effective_tp_rank={rank_key}, "
-                            f"effective_tp_size_per_node={effective_tp_size_per_node_recv}, "
-                            f"num_layers={recv_num_layers}, "
-                            f"num_counters={recv_num_counters}")
+                            f"[LayerwiseWorker] Received counter_id={counter_id}, "
+                            f"num_fds={len(fds)} from tp_rank_per_node={rank_key}")
 
-                        rank_eventfds = {}
-                        for _ in range(recv_num_counters):
-                            fds, extra_data = _recv_fds(conn, recv_num_layers)
-                            counter_id = struct.unpack("i", extra_data[:4])[0]
-                            rank_eventfds[counter_id] = fds
-                            flexkv_logger.debug(
-                                f"[LayerwiseWorker] Received counter_id={counter_id}, "
-                                f"num_fds={len(fds)} from tp_rank_per_node={rank_key}")
-
-                        all_rank_eventfds[rank_key] = rank_eventfds
-                        # Send ACK to client so it knows the fds were received
-                        try:
-                            conn.sendall(b"\x01")
-                        except Exception:
-                            pass
-                        flexkv_logger.info(
-                            f"[LayerwiseWorker] Received all eventfds from effective_tp_rank={rank_key} "
-                            f"on {socket_path}")
+                    all_rank_eventfds[rank_key] = rank_eventfds
+                    try:
+                        conn.sendall(b"\x01")
+                    except Exception:
+                        pass
+                    self._eventfd_clients.append(conn)
+                    flexkv_logger.info(
+                        f"[LayerwiseWorker] Received all eventfds from effective_tp_rank={rank_key} "
+                        f"on {socket_path}")
                 except Exception as e:
                     # Send NACK so client knows to retry
                     try:
                         conn.sendall(b"\x00")
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
                     except Exception:
                         pass
                     flexkv_logger.warning(
@@ -898,6 +906,53 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"counters={num_counters}, tp_size_per_rank={tp_group_size}, layers={num_layers}"
         )
         return tensor
+
+    def _complete_layer_ready_ipc_handoff(self) -> None:
+        """Send per-layer CUDA IPC event handles to Recsys after group init.
+
+        Protocol after the existing 1-byte eventfd ACK:
+        little-endian ``iiiii`` header (magic, counters, layers, gpus,
+        handle_size) plus the uint8 blob. SGLang clients that close after ACK
+        simply cause a send failure which we ignore.
+        """
+        clients = list(getattr(self, "_eventfd_clients", []) or [])
+        self._eventfd_clients = []
+        payload = b""
+        counters = layers = gpus = handle_size = 0
+        group = getattr(self, "layerwise_transfer_group", None)
+        if group is not None:
+            try:
+                handles = group.export_layer_ready_ipc_handles()
+                counters, layers, gpus, handle_size = (
+                    int(x) for x in handles.shape
+                )
+                payload = bytes(handles.contiguous().cpu().numpy())
+            except Exception as error:
+                flexkv_logger.warning(
+                    "[LayerwiseWorker] export_layer_ready_ipc_handles failed: "
+                    f"{error}"
+                )
+        header = struct.pack(
+            "<iiiii", 0x43564554, counters, layers, gpus, handle_size
+        )
+        for conn in clients:
+            try:
+                conn.sendall(header + payload)
+            except Exception as error:
+                flexkv_logger.warning(
+                    f"[LayerwiseWorker] CUDA IPC event handoff send failed: {error}"
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if payload:
+            flexkv_logger.info(
+                "[LayerwiseWorker] CUDA IPC layer-ready handles sent: "
+                f"counters={counters} layers={layers} gpus={gpus} "
+                f"handle_size={handle_size}"
+            )
 
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,

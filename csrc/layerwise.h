@@ -132,6 +132,12 @@ public:
 
   ~LayerwiseTransferGroup();
 
+  // Per-layer GPU-ready CUDA events for Recsys ``stream.wait_event``.
+  // Layout of the returned uint8 tensor: [num_counters, num_layers, num_gpus,
+  // sizeof(cudaIpcEventHandle_t)]. Worker process records; peer opens via
+  // ``ImportedCudaEvent``.
+  torch::Tensor export_layer_ready_ipc_handles() const;
+
   // Single-group layerwise transfer: SSD->CPU (all layers) + CPU->GPU
   // (per layer_granularity batch).
   void layerwise_transfer(
@@ -359,6 +365,15 @@ private:
   void notify_layer_batch(int start_layer, int layers_this_batch);
   void event_polling_loop();
   void stop_polling_();
+
+  void init_layer_ready_events_();
+  void destroy_layer_ready_events_();
+  void record_layer_ready_(int start_layer, int layers_this_batch);
+  cudaEvent_t layer_ready_event_(int counter, int layer, int gpu) const;
+
+  // [counter][layer][gpu], created with cudaEventInterprocess.
+  std::vector<cudaEvent_t> layer_ready_events_;
+  int num_ready_counters_ = 0;
 };
 
 } // namespace flexkv

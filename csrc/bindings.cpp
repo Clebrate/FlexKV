@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -425,6 +426,58 @@ bool create_gds_file_binding(GDSManager &manager, const std::string &filename,
 }
 #endif
 
+namespace {
+
+class ImportedCudaEvent {
+public:
+  ImportedCudaEvent(const py::bytes &handle_bytes, int device) : device_(device) {
+    std::string bytes = handle_bytes;
+    if (bytes.size() != sizeof(cudaIpcEventHandle_t)) {
+      throw std::runtime_error(
+          "ImportedCudaEvent: handle size " + std::to_string(bytes.size()) +
+          " != sizeof(cudaIpcEventHandle_t) " +
+          std::to_string(sizeof(cudaIpcEventHandle_t)));
+    }
+    cudaIpcEventHandle_t handle;
+    std::memcpy(&handle, bytes.data(), sizeof(handle));
+    cudaError_t set_err = cudaSetDevice(device_);
+    if (set_err != cudaSuccess) {
+      throw std::runtime_error(std::string("ImportedCudaEvent cudaSetDevice: ") +
+                               cudaGetErrorString(set_err));
+    }
+    cudaError_t err = cudaIpcOpenEventHandle(&event_, handle);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("cudaIpcOpenEventHandle: ") + cudaGetErrorString(err));
+    }
+  }
+
+  ImportedCudaEvent(const ImportedCudaEvent &) = delete;
+  ImportedCudaEvent &operator=(const ImportedCudaEvent &) = delete;
+
+  ~ImportedCudaEvent() {
+    if (event_ != nullptr) {
+      cudaEventDestroy(event_);
+      event_ = nullptr;
+    }
+  }
+
+  void wait_stream(int64_t stream_ptr) const {
+    cudaError_t err = cudaStreamWaitEvent(
+        reinterpret_cast<cudaStream_t>(stream_ptr), event_, 0);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaStreamWaitEvent: ") +
+                               cudaGetErrorString(err));
+    }
+  }
+
+private:
+  cudaEvent_t event_ = nullptr;
+  int device_ = 0;
+};
+
+} // namespace
+
 PYBIND11_MODULE(c_ext, m) {
   m.attr("__git_commit__") = FLEXKV_GIT_COMMIT;
 
@@ -714,7 +767,15 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("kv_shared_across_ranks_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false);
+           py::arg("enable_trace") = false)
+      .def("export_layer_ready_ipc_handles",
+           &flexkv::LayerwiseTransferGroup::export_layer_ready_ipc_handles);
+
+  py::class_<ImportedCudaEvent>(m, "ImportedCudaEvent")
+      .def(py::init<py::bytes, int>(), py::arg("handle_bytes"),
+           py::arg("device"))
+      .def("wait_stream", &ImportedCudaEvent::wait_stream,
+           py::arg("stream_ptr"));
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,

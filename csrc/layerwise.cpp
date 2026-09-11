@@ -1,10 +1,13 @@
 #include "layerwise.h"
 #include "logging.h"
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
 #include <stdexcept>
+#include <string>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -31,6 +34,118 @@ void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
       }
     }
   }
+}
+
+static void layer_ready_check_cuda(cudaError_t err, const char *what) {
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+  }
+}
+
+cudaEvent_t LayerwiseTransferGroup::layer_ready_event_(int counter, int layer,
+                                                       int gpu) const {
+  return layer_ready_events_[(counter * num_layers_ + layer) * num_gpus_ + gpu];
+}
+
+void LayerwiseTransferGroup::init_layer_ready_events_() {
+  num_ready_counters_ = num_counters_ > 0 ? num_counters_ : 3;
+  const int n = num_ready_counters_ * num_layers_ * num_gpus_;
+  layer_ready_events_.assign(n, nullptr);
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  for (int g = 0; g < num_gpus_; ++g) {
+    layer_ready_check_cuda(cudaSetDevice(gpu_device_ids_[g]),
+                           "init_layer_ready_events cudaSetDevice");
+    for (int c = 0; c < num_ready_counters_; ++c) {
+      for (int l = 0; l < num_layers_; ++l) {
+        cudaEvent_t *ev =
+            &layer_ready_events_[(c * num_layers_ + l) * num_gpus_ + g];
+        layer_ready_check_cuda(
+            cudaEventCreateWithFlags(
+                ev, cudaEventDisableTiming | cudaEventInterprocess),
+            "cudaEventCreateWithFlags(layer_ready)");
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+  FLEXKV_LOG_INFO(
+      "operation=layerwise_init act=complete status=success "
+      "layer_ready_events=true counters=%d layers=%d gpus=%d",
+      num_ready_counters_, num_layers_, num_gpus_);
+}
+
+void LayerwiseTransferGroup::destroy_layer_ready_events_() {
+  if (layer_ready_events_.empty()) {
+    return;
+  }
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  for (int g = 0; g < num_gpus_; ++g) {
+    cudaSetDevice(gpu_device_ids_[g]);
+    for (int c = 0; c < num_ready_counters_; ++c) {
+      for (int l = 0; l < num_layers_; ++l) {
+        cudaEvent_t ev =
+            layer_ready_events_[(c * num_layers_ + l) * num_gpus_ + g];
+        if (ev != nullptr) {
+          cudaEventDestroy(ev);
+        }
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+  layer_ready_events_.clear();
+  num_ready_counters_ = 0;
+}
+
+void LayerwiseTransferGroup::record_layer_ready_(int start_layer,
+                                                 int layers_this_batch) {
+  if (layer_ready_events_.empty()) {
+    return;
+  }
+  const int c = current_counter_id_;
+  if (c < 0 || c >= num_ready_counters_) {
+    return;
+  }
+  for (int layer = start_layer; layer < start_layer + layers_this_batch;
+       ++layer) {
+    if (layer < 0 || layer >= num_layers_) {
+      continue;
+    }
+    for (int g = 0; g < num_gpus_; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      layer_ready_check_cuda(
+          cudaEventRecord(layer_ready_event_(c, layer, g), streams_[g]),
+          "cudaEventRecord(layer_ready)");
+    }
+  }
+}
+
+torch::Tensor LayerwiseTransferGroup::export_layer_ready_ipc_handles() const {
+  const int handle_size = static_cast<int>(sizeof(cudaIpcEventHandle_t));
+  if (layer_ready_events_.empty()) {
+    return torch::empty({0, 0, 0, handle_size}, torch::dtype(torch::kUInt8));
+  }
+  auto out = torch::empty(
+      {num_ready_counters_, num_layers_, num_gpus_, handle_size},
+      torch::dtype(torch::kUInt8));
+  uint8_t *ptr = out.data_ptr<uint8_t>();
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+  for (int c = 0; c < num_ready_counters_; ++c) {
+    for (int l = 0; l < num_layers_; ++l) {
+      for (int g = 0; g < num_gpus_; ++g) {
+        cudaSetDevice(gpu_device_ids_[g]);
+        cudaIpcEventHandle_t handle;
+        layer_ready_check_cuda(
+            cudaIpcGetEventHandle(&handle, layer_ready_event_(c, l, g)),
+            "cudaIpcGetEventHandle(layer_ready)");
+        std::memcpy(ptr, &handle, sizeof(handle));
+        ptr += handle_size;
+      }
+    }
+  }
+  cudaSetDevice(prev_device);
+  return out;
 }
 
 void LayerwiseTransferGroup::event_polling_loop() {
@@ -643,6 +758,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                     swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
                     swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
                     num_layers, iouring_entries, iouring_flags);
+  init_layer_ready_events_();
 }
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
@@ -835,6 +951,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
                     swa_gpu_kv_strides_tensor, swa_gpu_block_strides_tensor,
                     swa_gpu_layer_strides_tensor, swa_gpu_chunk_sizes_tensor,
                     num_original_layers, iouring_entries, iouring_flags);
+  init_layer_ready_events_();
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
@@ -860,6 +977,8 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
       }
     }
   }
+
+  destroy_layer_ready_events_();
 
   // Save/restore device: a leaked current-device makes the device-keyed
   // ping-pong event cache in ce_transfer.cu hit the wrong GPU → segfault.
@@ -1222,6 +1341,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
         cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i],
                         streams_[i]);
       }
+      record_layer_ready_(start_layer, layers_this_batch);
     } else {
       // NVTX: current range ends in callback, next range starts in callback
       bool is_last_batch = (batch_idx == num_batches - 1);
@@ -1230,6 +1350,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
       nvtxRangeId_t *next_id_ptr =
           is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
 
+      record_layer_ready_(start_layer, layers_this_batch);
       layer_done_callback(start_layer, layers_this_batch, num_gpus_,
                           &h2d_range_ids[batch_idx], is_last_batch, next_name,
                           next_id_ptr);
@@ -1433,8 +1554,14 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     }
   }
 
-  // Empty-member layers: immediate eventfd only when neither main nor SWA
-  // has work for this original layer.
+  // Empty-member layers: GPU-ready event (and optional eventfd) immediately.
+  for (int orig = 0; orig < num_original_layers_; ++orig) {
+    const bool has_swa_work = swa_slots_for_orig_(orig, swa_active) > 0;
+    if (!layer_members_[orig].empty() || has_swa_work) {
+      continue;
+    }
+    record_layer_ready_(orig, 1);
+  }
   if (enable_eventfd_ && num_counters_ > 0 && !layer_eventfds_.empty()) {
     int offset = current_counter_id_ * tp_size_ * num_layers_;
     int *eventfds_ptr = layer_eventfds_.data() + offset;
@@ -1612,6 +1739,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         cudaEventRecord(poll_batches_[ai].per_gpu_events[d], streams_[d]);
       }
     }
+    record_layer_ready_(orig, 1);
 
     bool is_last_active = (ai + 1 == work_origs.size());
     int next_orig = is_last_active ? -1 : work_origs[ai + 1];
