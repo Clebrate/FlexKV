@@ -1009,7 +1009,8 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
-        # self._sync_prefetch(token_ids, namespace)
+        nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
+        self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
@@ -1173,7 +1174,7 @@ class KVTaskEngine(KVTaskManager):
         untouched.
         """
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
-        # self._sync_prefetch(token_ids, namespace)
+        self._sync_prefetch(token_ids, namespace)
         # Flush pending D2H completions so set_ready callbacks run before
         # we check the radix tree.  Without this, blocks offloaded between
         # scheduler steps remain "not ready" until the next try_wait call,
