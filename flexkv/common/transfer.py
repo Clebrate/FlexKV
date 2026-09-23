@@ -221,6 +221,11 @@ class TransferOp:
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     # Tail-hash list for SWA mooncake REMOTE2H/H2REMOTE (one entry per SWA slot).
     mooncake_store_swa_block_hashes: Optional[List[str]] = None
+    # Layer span this op owns. ``layer_granularity <= 0`` means all layers
+    # (the historical whole-KV path). Used to split DISK2H / LAYERWISE so
+    # one SSD slice feeds one GPU slice of the same [start, start+gran).
+    layer_id: int = 0
+    layer_granularity: int = -1
     # Filled by the scheduler as partial-capable worker completions arrive.
     block_results: Optional[Tuple[bool, ...]] = field(default=None, init=False)
 
@@ -273,7 +278,9 @@ class LayerwiseTransferOp(TransferOp):
                 swa_src_block_ids_h2d: Optional[np.ndarray] = None,
                 swa_dst_block_ids_h2d: Optional[np.ndarray] = None,
                 dp_client_id: int = 0,
-                counter_id: int = 0) -> None:
+                counter_id: int = 0,
+                layer_id: int = 0,
+                layer_granularity: int = -1) -> None:
         self.src_block_ids_h2d = src_block_ids_h2d
         self.dst_block_ids_h2d = dst_block_ids_h2d
         # SWA ids default to empty arrays so callers that only need the main-KV
@@ -291,6 +298,8 @@ class LayerwiseTransferOp(TransferOp):
             src_block_ids=np.array([], dtype=np.int64),
             dst_block_ids=np.array([], dtype=np.int64),
             dp_client_id=dp_client_id,
+            layer_id=layer_id,
+            layer_granularity=layer_granularity,
         )
 
     def __post_init__(self, is_swa: Optional[bool] = None) -> None:
@@ -735,6 +744,80 @@ def add_virtual_op_for_multiple_finished_ops(
     return graph, op.op_id
 
 
+def iter_layer_spans(num_layers: int, gran: int) -> List[Tuple[int, int]]:
+    """Split ``[0, num_layers)`` into ``(start, count)`` spans of size ``gran``.
+
+    ``gran <= 0`` is the historical whole-KV path: a single span whose count
+    sentinel is ``-1`` (worker treats it as all remaining layers).
+    """
+    if num_layers <= 0:
+        return [(0, -1)]
+    if gran is None or int(gran) <= 0:
+        return [(0, -1)]
+    gran = int(gran)
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    while start < num_layers:
+        count = min(gran, num_layers - start)
+        spans.append((start, count))
+        start += count
+    return spans
+
+
+def op_span_key(op: TransferOp) -> Tuple[int, int]:
+    layer_id = int(getattr(op, "layer_id", 0) or 0)
+    gran = getattr(op, "layer_granularity", -1)
+    if gran is None:
+        gran = -1
+    return (layer_id, int(gran))
+
+
+def _span_covers(pred_span: Tuple[int, int], target_span: Tuple[int, int]) -> bool:
+    """True if a predecessor of ``pred_span`` must complete before ``target_span``.
+
+    A whole-KV predecessor (``gran <= 0``) covers every target. A sliced
+    predecessor covers only the matching slice, so layer 0's H2D does not wait
+    on a later SSD span.
+    """
+    pred_start, pred_gran = pred_span
+    if pred_gran is None or int(pred_gran) <= 0:
+        return True
+    return pred_span == target_span
+
+
+def _copy_layer_span(dst: TransferOp, src: TransferOp) -> TransferOp:
+    dst.layer_id = int(getattr(src, "layer_id", 0) or 0)
+    dst.layer_granularity = int(getattr(src, "layer_granularity", -1) or -1)
+    return dst
+
+
+def _merge_ops_by_span(
+        ops: List[TransferOp],
+        transfer_type: TransferType,
+        graph: TransferOpGraph,
+        callbacks: List[Tuple[TransferOp, Callable]],
+        op_callback_dict: Dict[int, Callable],
+        merge_fn: Callable) -> List[Tuple[TransferOp, List[TransferOp],
+                                           List[Tuple[TransferOp, Callable]]]]:
+    """Merge ops that share a layer span; leave different spans independent."""
+    if not ops:
+        return []
+    groups: Dict[Tuple[int, int], List[TransferOp]] = {}
+    for op in ops:
+        groups.setdefault(op_span_key(op), []).append(op)
+    merged_list = []
+    for span, group in groups.items():
+        group_ids = {op.op_id for op in group}
+        group_cbs = [pair for pair in callbacks if pair[0].op_id in group_ids]
+        merged = merge_fn(
+            group, transfer_type, graph, group_cbs, op_callback_dict)
+        if merged is None:
+            continue
+        merged.layer_id, merged.layer_granularity = span
+        merged_list.append((merged, group, group_cbs))
+    return merged_list
+
+
 def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
                graph: TransferOpGraph,
                callbacks: List[Tuple[TransferOp, Callable]],
@@ -781,6 +864,8 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         dp_client_id=ops[0].dp_client_id,
         src_is_staged=any(getattr(op, "src_is_staged", False) for op in ops),
         mooncake_store_block_hashes=merged_kv_hashes,
+        layer_id=int(getattr(ops[0], "layer_id", 0) or 0),
+        layer_granularity=int(getattr(ops[0], "layer_granularity", -1) or -1),
     )
     _attach_merged_callbacks(
         merged_op, ops, callbacks, op_callback_dict)
@@ -833,6 +918,8 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
         dp_client_id=ops[0].dp_client_id,
         pool_id=PoolId.SWA,
         mooncake_store_swa_block_hashes=merged_swa_hashes,
+        layer_id=int(getattr(ops[0], "layer_id", 0) or 0),
+        layer_granularity=int(getattr(ops[0], "layer_granularity", -1) or -1),
     )
     _attach_merged_callbacks(
         merged_op, ops, callbacks, op_callback_dict)
@@ -1003,10 +1090,11 @@ def merge_to_batch_graph(batch_id: int,
         ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
     if has_get:
-        merged_disk2h_op = _merge_ops(
+        merged_disk2h_groups = _merge_ops_by_span(
             ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
             merged_graph, callbacks_by_type[TransferType.DISK2H],
-            local_cb_dict)
+            local_cb_dict, _merge_ops)
+        merged_disk2h_ops = [item[0] for item in merged_disk2h_groups]
         # Keep the resident lane out of the merged H2D when it is split (see
         # CacheEngine._build_get_h2d_ops): fusing them back together would put
         # every task's CPU hits behind the slowest DISK2H/REMOTE2H in the batch,
@@ -1032,10 +1120,11 @@ def merge_to_batch_graph(batch_id: int,
             ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
             merged_graph, callbacks_by_type[TransferType.REMOTE2H],
             new_op_callback_dict)
-        merged_swa_disk2h_op = _merge_swa_ops(
+        merged_swa_disk2h_groups = _merge_ops_by_span(
             swa_ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
             merged_graph, swa_callbacks_by_type[TransferType.DISK2H],
-            local_cb_dict)
+            local_cb_dict, _merge_swa_ops)
+        merged_swa_disk2h_ops = [item[0] for item in merged_swa_disk2h_groups]
         merged_swa_h2d_op = _merge_swa_ops(
             swa_ops_by_type[TransferType.H2D], TransferType.H2D,
             merged_graph, swa_callbacks_by_type[TransferType.H2D],
@@ -1053,102 +1142,101 @@ def merge_to_batch_graph(batch_id: int,
                 "layerwise GET requires an H2D (main or SWA)"
 
             # The SSD read is an ordinary DISK2H op the LAYERWISE op depends on,
-            # never a fused Step 0 inside the layerwise worker.  It has to be:
-            # this commit replaces the SSD-capable LayerwiseTransferWorker with
-            # the plain CPU<->GPU worker under a PER_LAYER contract, and that
-            # worker has no SSD binding at all -- ids fused onto the op would be
-            # read by nobody.  Hoisting also lets the SSD read overlap with
-            # anything else the engine has queued.
-            #
-            # Byte-for-byte it is the same read either way:
-            # CPUSSDDiskTransferWorker derives its strides from the same CPU/SSD
-            # layouts and calls transfer_kv_blocks_ssd over all layers with full
-            # (non-TP-divided) CPU strides.
-            layerwise_disk2h_ops = [op for op in (merged_disk2h_op,
-                                                  merged_swa_disk2h_op)
-                                    if op is not None]
+            # never a fused Step 0 inside the layerwise worker. One LAYERWISE
+            # per SSD span so layer 0's H2D can start when that span is on CPU.
+            layerwise_disk2h_ops = merged_disk2h_ops + merged_swa_disk2h_ops
             for op in layerwise_disk2h_ops:
                 merged_graph.add_transfer_op(op)
-            # The callbacks ride the hoisted ops, which fires them at CPU-ready
-            # rather than GPU-ready -- correctly so: they publish CPU blocks into
-            # the radix tree, which is exactly what a finished DISK2H
-            # established.
-            # Re-attach with per-source spans, exactly as _merge_ops would have:
-            # a hoisted DISK2H is a merged op, so a partial-capable completion
-            # must still slice back to the task that contributed each block.
-            if merged_disk2h_op is not None:
+            # Re-attach with per-source spans onto the scheduler callback dict
+            # (hoisted DISK2H fires at CPU-ready, not GPU-ready).
+            for merged_op, source_ops, source_cbs in merged_disk2h_groups:
                 _attach_merged_callbacks(
-                    merged_disk2h_op, ops_by_type[TransferType.DISK2H],
-                    callbacks_by_type[TransferType.DISK2H],
-                    new_op_callback_dict)
-            if merged_swa_disk2h_op is not None:
+                    merged_op, source_ops, source_cbs, new_op_callback_dict)
+            for merged_op, source_ops, source_cbs in merged_swa_disk2h_groups:
                 _attach_merged_callbacks(
-                    merged_swa_disk2h_op, swa_ops_by_type[TransferType.DISK2H],
-                    swa_callbacks_by_type[TransferType.DISK2H],
-                    new_op_callback_dict)
+                    merged_op, source_ops, source_cbs, new_op_callback_dict)
 
-            layerwise_transfer_op = LayerwiseTransferOp(
-                graph_id=merged_graph.graph_id,
-                src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                swa_src_block_ids_h2d=merged_swa_h2d_op.src_block_ids
-                    if merged_swa_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                swa_dst_block_ids_h2d=merged_swa_h2d_op.dst_block_ids
-                    if merged_swa_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                dp_client_id=dp_client_id,
-                counter_id=counter_id,
-            )
-            merged_graph.add_transfer_op(layerwise_transfer_op)
+            empty_h2d = np.array([], dtype=np.int64)
+            h2d_src = merged_h2d_op.src_block_ids if merged_h2d_op is not None else empty_h2d
+            h2d_dst = merged_h2d_op.dst_block_ids if merged_h2d_op is not None else empty_h2d
+            swa_h2d_src = (merged_swa_h2d_op.src_block_ids
+                           if merged_swa_h2d_op is not None else empty_h2d)
+            swa_h2d_dst = (merged_swa_h2d_op.dst_block_ids
+                           if merged_swa_h2d_op is not None else empty_h2d)
 
-            if merged_remote2h_op is not None:
-                merged_graph.add_dependency(
-                    layerwise_transfer_op.op_id, merged_remote2h_op.op_id)
-            if merged_swa_remote2h_op is not None:
-                merged_graph.add_dependency(
-                    layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
-
-            # The per-layer H2D reads CPU blocks the hoisted DISK2H fills, so it
-            # must not start before that op is BACKEND_DONE. This edge is the
-            # whole safety argument for the hoisted SSD read.
+            spans: List[Tuple[int, int]] = []
             for op in layerwise_disk2h_ops:
-                merged_graph.add_dependency(
-                    layerwise_transfer_op.op_id, op.op_id)
+                key = op_span_key(op)
+                if key not in spans:
+                    spans.append(key)
+            if not spans:
+                spans = [(0, -1)]
 
-            # DISK2H callbacks are NOT here: the SSD read is hoisted into its own
-            # op above and fires its own callbacks at CPU-ready. Only the H2D
-            # lanes fold into LAYERWISE.
+            layerwise_ops: List[LayerwiseTransferOp] = []
+            for start, gran in spans:
+                layerwise_transfer_op = LayerwiseTransferOp(
+                    graph_id=merged_graph.graph_id,
+                    src_block_ids_h2d=h2d_src,
+                    dst_block_ids_h2d=h2d_dst,
+                    swa_src_block_ids_h2d=swa_h2d_src,
+                    swa_dst_block_ids_h2d=swa_h2d_dst,
+                    dp_client_id=dp_client_id,
+                    counter_id=counter_id,
+                    layer_id=start,
+                    layer_granularity=gran,
+                )
+                merged_graph.add_transfer_op(layerwise_transfer_op)
+                if merged_remote2h_op is not None:
+                    merged_graph.add_dependency(
+                        layerwise_transfer_op.op_id, merged_remote2h_op.op_id)
+                if merged_swa_remote2h_op is not None:
+                    merged_graph.add_dependency(
+                        layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
+                for op in layerwise_disk2h_ops:
+                    if _span_covers(op_span_key(op), (start, gran)):
+                        merged_graph.add_dependency(
+                            layerwise_transfer_op.op_id, op.op_id)
+                layerwise_ops.append(layerwise_transfer_op)
+
             layerwise_callbacks: List[Callable] = []
             layerwise_callbacks.extend(
                 callback for _, callback in callbacks_by_type[TransferType.H2D])
             layerwise_callbacks.extend(
                 callback for _, callback in swa_callbacks_by_type[TransferType.H2D])
-            _attach_combined_callback(
-                layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
-            batch_end_op_id = layerwise_transfer_op.op_id
+            if len(layerwise_ops) == 1:
+                _attach_combined_callback(
+                    layerwise_ops[0], layerwise_callbacks, new_op_callback_dict)
+                batch_end_op_id = layerwise_ops[0].op_id
+            else:
+                batch_end_op_id = _add_batch_sink(
+                    merged_graph,
+                    [op.op_id for op in layerwise_ops],
+                    dp_client_id)
+                if batch_end_op_id >= 0 and layerwise_callbacks:
+                    sink_op = merged_graph._op_map[batch_end_op_id]
+                    _attach_combined_callback(
+                        sink_op, layerwise_callbacks, new_op_callback_dict)
         else:
-            for op in (merged_disk2h_op, merged_resident_h2d_op, merged_h2d_op,
-                       merged_remote2h_op, merged_swa_disk2h_op,
-                       merged_swa_h2d_op, merged_swa_remote2h_op):
+            for op in ([merged_resident_h2d_op, merged_h2d_op,
+                        merged_remote2h_op, merged_swa_h2d_op,
+                        merged_swa_remote2h_op]
+                       + merged_disk2h_ops + merged_swa_disk2h_ops):
                 if op is not None:
                     merged_graph.add_transfer_op(op)
 
             # merged_resident_h2d_op deliberately gets no predecessors: its
             # source blocks are already in host memory.
             if merged_h2d_op is not None:
-                if merged_disk2h_op is not None:
+                for disk2h_op in merged_disk2h_ops:
                     merged_graph.add_dependency(
-                        merged_h2d_op.op_id, merged_disk2h_op.op_id)
+                        merged_h2d_op.op_id, disk2h_op.op_id)
                 if merged_remote2h_op is not None:
                     merged_graph.add_dependency(
                         merged_h2d_op.op_id, merged_remote2h_op.op_id)
             if merged_swa_h2d_op is not None:
-                if merged_swa_disk2h_op is not None:
+                for disk2h_op in merged_swa_disk2h_ops:
                     merged_graph.add_dependency(
-                        merged_swa_h2d_op.op_id, merged_swa_disk2h_op.op_id)
+                        merged_swa_h2d_op.op_id, disk2h_op.op_id)
                 if merged_swa_remote2h_op is not None:
                     merged_graph.add_dependency(
                         merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
@@ -1167,8 +1255,8 @@ def merge_to_batch_graph(batch_id: int,
                 # full-KV and SWA leaf must be a terminal. Taking only the first
                 # would mark the batch done while another REMOTE2H/DISK2H lane
                 # is still in flight.
-                for op in (merged_remote2h_op, merged_swa_remote2h_op,
-                           merged_disk2h_op, merged_swa_disk2h_op):
+                for op in ([merged_remote2h_op, merged_swa_remote2h_op]
+                           + merged_disk2h_ops + merged_swa_disk2h_ops):
                     if op is not None:
                         get_sinks.append(op.op_id)
             batch_end_op_id = _add_batch_sink(

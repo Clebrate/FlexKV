@@ -735,6 +735,11 @@ class CacheConfig:
     # until that worker is registered, otherwise SWA ops would hit "Unsupported
     # transfer type" in the transfer engine. Flip to True once the worker lands.
     enable_swa_transfer: bool = False
+    # SSD / GPU layer span. ``<= 0`` keeps a single DISK2H + LAYERWISE over
+    # all model layers. Recsys should set this at CacheConfig init to the
+    # same N used by launch_tasks(layerwise_transfer=True). Layerwise default
+    # is 1 (one original layer per SSD slice).
+    layer_granularity: int = -1
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -800,6 +805,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKFIRST').upper()),
 
     enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
+    layer_granularity=int(os.getenv('FLEXKV_LAYER_GRANULARITY', -1)),
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),

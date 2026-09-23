@@ -41,6 +41,7 @@ from flexkv.common.transfer import (
     TransferOp,
     TransferType,
     add_virtual_op_for_multiple_finished_ops,
+    iter_layer_spans,
 )
 from flexkv.common.debug import (
     eviction_log_aggregator,
@@ -1304,6 +1305,43 @@ class GlobalCacheEngine:
             self.remote_cache_engine.recycle(remote_blocks)
         return self._empty_put_return(request_id)
 
+    def _disk2h_layer_spans(self) -> List[Tuple[int, int]]:
+        num_layers = int(self.model_config.num_layers)
+        gran = int(getattr(self.cache_config, "layer_granularity", -1) or -1)
+        if gran <= 0:
+            env_gran = getattr(GLOBAL_CONFIG_FROM_ENV, "layer_granularity", -1)
+            try:
+                gran = int(env_gran)
+            except (TypeError, ValueError):
+                gran = -1
+        return iter_layer_spans(num_layers, gran)
+
+    def _make_sliced_host_ops(
+            self,
+            transfer_graph: TransferOpGraph,
+            *,
+            transfer_type: TransferType,
+            src_block_ids: np.ndarray,
+            dst_block_ids: np.ndarray,
+            dp_client_id: int,
+            **kwargs) -> List[TransferOp]:
+        """One DISK2H/PEERSSD2H per CacheConfig.layer_granularity span."""
+        ops: List[TransferOp] = []
+        for start, gran in self._disk2h_layer_spans():
+            op = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=transfer_type,
+                src_block_ids=src_block_ids,
+                dst_block_ids=dst_block_ids,
+                dp_client_id=dp_client_id,
+                layer_id=start,
+                layer_granularity=gran,
+                **kwargs,
+            )
+            transfer_graph.add_transfer_op(op)
+            ops.append(op)
+        return ops
+
     @staticmethod
     def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
                            cpu_blocks: np.ndarray,
@@ -1534,15 +1572,16 @@ class GlobalCacheEngine:
                 self._metrics_collector.record_cache_miss(miss_blocks)
 
         op_disk2h = None
+        op_disk2h_ops: List[TransferOp] = []
         if fragment2_num_blocks > 0:
-            op_disk2h = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.DISK2H,
-                src_block_ids = fragment2_ssd_blocks,
-                dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
-                dp_client_id = dp_client_id,
+            op_disk2h_ops = self._make_sliced_host_ops(
+                transfer_graph,
+                transfer_type=TransferType.DISK2H,
+                src_block_ids=fragment2_ssd_blocks,
+                dst_block_ids=fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
+                dp_client_id=dp_client_id,
             )
-            transfer_graph.add_transfer_op(op_disk2h)
+            op_disk2h = op_disk2h_ops[-1] if op_disk2h_ops else None
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
@@ -1611,8 +1650,10 @@ class GlobalCacheEngine:
         # stay None and these set_ready callbacks are not registered.
         op_callback_dict = {}
         host_finished_ops_ids = [
-            op.op_id for op in (op_disk2h, op_remote2h) if op is not None
+            op.op_id for op in op_disk2h_ops
         ]
+        if op_remote2h is not None:
+            host_finished_ops_ids.append(op_remote2h.op_id)
         host_ready_op_id = -1
         if host_finished_ops_ids:
             transfer_graph, host_ready_op_id = add_virtual_op_for_multiple_finished_ops(
@@ -1650,8 +1691,9 @@ class GlobalCacheEngine:
             # single H2D over all three would gate the resident blocks on those
             # reads, so split the lanes when both sides are non-empty and let
             # the resident H2D start immediately.
-            staged_predecessors = [op for op in (op_disk2h, op_remote2h)
-                                   if op is not None]
+            staged_predecessors = list(op_disk2h_ops)
+            if op_remote2h is not None:
+                staged_predecessors.append(op_remote2h)
             split_h2d = bool(GLOBAL_CONFIG_FROM_ENV.split_resident_h2d
                              and staged_predecessors
                              and 0 < fragment1_num_blocks < len(fragment123_cpu_blocks))
@@ -1899,8 +1941,10 @@ class GlobalCacheEngine:
         # prepare cpu blocks to transfer
         cpu_blocks_to_free = np.array([], dtype=np.int64)
         op_disk2h = None
+        op_disk2h_ops: List[TransferOp] = []
         op_gds_transfer = None
         fragment2_cpu_blocks = None
+        cpu_span_barrier: Optional[Dict] = None
 
         # Allocate CPU blocks only for paths that actually stage data through
         # host memory. GDS moves fragment2 directly from SSD to GPU.
@@ -1986,19 +2030,21 @@ class GlobalCacheEngine:
             else:
                 fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
 
-                op_disk2h = TransferOp(
-                    graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.PEERSSD2H
-                        if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
-                    src_block_ids = fragment2_ssd_blocks,
-                    dst_block_ids = fragment2_cpu_blocks,
-                    remote_node_ids = ssd_matched_result.matched_node_ids
-                        if ssd_matched_result.matched_pos == "remote" else None,
-                    src_block_node_ids = ssd_matched_result.matched_node_ids
-                        if ssd_matched_result.matched_pos == "remote" else None,
-                    dp_client_id = dp_client_id,
+                extra_kwargs = {}
+                if ssd_matched_result.matched_pos == "remote":
+                    extra_kwargs["remote_node_ids"] = ssd_matched_result.matched_node_ids
+                    extra_kwargs["src_block_node_ids"] = ssd_matched_result.matched_node_ids
+                op_disk2h_ops = self._make_sliced_host_ops(
+                    transfer_graph,
+                    transfer_type=(TransferType.PEERSSD2H
+                                   if ssd_matched_result.matched_pos == "remote"
+                                   else TransferType.DISK2H),
+                    src_block_ids=fragment2_ssd_blocks,
+                    dst_block_ids=fragment2_cpu_blocks,
+                    dp_client_id=dp_client_id,
+                    **extra_kwargs,
                 )
-                transfer_graph.add_transfer_op(op_disk2h)
+                op_disk2h = op_disk2h_ops[-1] if op_disk2h_ops else None
                 # we only insert the buffer blocks to cpu cache engine only:
                 # 1. the cpu cache engine satisfies prefix cache after insertion
                 # 2. the sequence is all ready blocks
@@ -2013,7 +2059,17 @@ class GlobalCacheEngine:
                                                                         block_mask_start,
                                                                     is_ready=False,
                                                                     match_result=cpu_matched_result)
-                    op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                    # CPU is fully ready only after every layer span has landed.
+                    if len(op_disk2h_ops) == 1:
+                        op_node_to_ready[op_disk2h.op_id] = (
+                            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                    else:
+                        cpu_span_barrier = {
+                            "n": len(op_disk2h_ops),
+                            "node": cpu_node_to_unlock,
+                            "ready_length": cpu_node_to_unlock.size(),
+                            "op_ids": [op.op_id for op in op_disk2h_ops],
+                        }
                 else:
                     cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
         if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
@@ -2029,8 +2085,7 @@ class GlobalCacheEngine:
             h2d_gpu_blocks = fragment12_gpu_blocks if not enable_gds \
                 else fragment12_gpu_blocks[:fragment1_num_blocks]
             staged_predecessors = []
-            if op_disk2h is not None:
-                staged_predecessors.append(op_disk2h)
+            staged_predecessors.extend(op_disk2h_ops)
             # A "remote" CPU match means fragment1 itself is staged in by
             # op_peerh2h, so it is NOT resident and the split does not apply.
             fragment1_is_staged = (cpu_matched_result.matched_pos == "remote"
@@ -2042,7 +2097,7 @@ class GlobalCacheEngine:
             split_h2d = bool(GLOBAL_CONFIG_FROM_ENV.split_resident_h2d
                              and not enable_gds
                              and not fragment1_is_staged
-                             and op_disk2h is not None
+                             and op_disk2h_ops
                              and 0 < fragment1_num_blocks < len(h2d_cpu_blocks))
             for op_h2d in self._build_get_h2d_ops(
                     transfer_graph=transfer_graph,
@@ -2053,6 +2108,8 @@ class GlobalCacheEngine:
                     dp_client_id=dp_client_id,
                     staged_predecessors=staged_predecessors):
                 finished_ops_ids.append(op_h2d.op_id)
+        elif op_disk2h_ops:
+            finished_ops_ids.extend(op.op_id for op in op_disk2h_ops)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -2062,6 +2119,24 @@ class GlobalCacheEngine:
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
         op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_span_barrier is not None:
+            pending = {"n": int(cpu_span_barrier["n"])}
+            node = cpu_span_barrier["node"]
+            ready_length = cpu_span_barrier["ready_length"]
+
+            def _on_disk2h_span_done(
+                    _pending=pending, _node=node, _ready_length=ready_length):
+                _pending["n"] -= 1
+                if _pending["n"] == 0:
+                    self._op_callback(
+                        device_type=DeviceType.CPU,
+                        node_to_ready=_node,
+                        ready_length=_ready_length,
+                    )
+
+            for op_id in cpu_span_barrier["op_ids"]:
+                self._append_op_callback(
+                    op_callback_dict, op_id, _on_disk2h_span_done)
 
         if swa_reservation is not None:
             assert num_gpu_blocks_to_transfer > 0
